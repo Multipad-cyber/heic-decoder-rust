@@ -85,7 +85,7 @@ pub fn parse_slice_header(rbsp: &[u8], nal_unit_type: u8, sps: &Sps, pps: &Pps) 
     let mut sao_chroma = false;
     if sps.sample_adaptive_offset_enabled {
         sao_luma = r.flag()?;
-        sao_chroma = r.flag()?;
+        if sps.chroma_format_idc != 0 { sao_chroma = r.flag()?; }
     }
 
     let inter = if slice_type == 1 {
@@ -201,6 +201,8 @@ mod tests {
             chroma_format_idc: 1,
             pic_width_in_luma_samples: 16,
             pic_height_in_luma_samples: 16,
+            conformance_window: [0; 4],
+            color_info: None, chroma_location: None,
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             log2_min_luma_coding_block_size: 3,

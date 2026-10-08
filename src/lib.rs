@@ -1,10 +1,14 @@
 //! A pure-Rust HEIF/HEIC still-image decoder.
 //!
-//! Decodes HEVC Main/Main10 and basic 4:2:2/4:4:4 images, including grid photos
+//! Decodes HEVC Main/Main10, monochrome and basic 4:2:2/4:4:4 images, including grid photos
 //! iPhones produce, to planar YCbCr that is bit-exact against HM, the
 //! official HEVC reference decoder. Rotation, mirroring and cropping from
 //! the file are applied; the ICC profile, EXIF and XMP are returned as raw
 //! bytes. Malformed input returns an error rather than panicking.
+//! RGB conversion is optional: use [`DecodedImage::to_rgb8`] or
+//! [`DecodedImage::to_rgb16`] when the caller needs interleaved RGB.
+//! Auxiliary alpha is returned in [`DecodedImage::alpha`]; use
+//! [`DecodedImage::to_rgba8`] or [`DecodedImage::to_rgba16`] to retain it.
 //!
 //! ```no_run
 //! let data = std::fs::read("photo.heic")?;
@@ -19,11 +23,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
 pub mod bitreader;
+pub mod color;
 pub mod error;
 pub mod hevc;
 pub mod isobmff;
 
 pub use error::{HeifError, Result};
+pub use color::{ChromaSampling, ChromaUpsampling, ColorInfo, RgbImage, RgbOptions, RgbaImage};
 
 /// Largest picture, in luma samples, that the decoder will allocate
 /// (2^28, about 268 megapixels). Applies to each coded image, to the
@@ -40,14 +46,24 @@ use hevc::sao::apply_sao;
 use hevc::slice::parse_slice_header;
 use isobmff::{split_length_prefixed_nalus, ResolvedImage};
 
-/// A decoded still image: planar YCbCr (4:2:0, 4:2:2 or 4:4:4),
+/// Native, full-range opacity: zero is transparent, `(1 << bit_depth) - 1`
+/// is opaque. Samples have the same dimensions and orientation as the image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlphaPlane {
+    pub bit_depth: u32,
+    pub samples: Vec<i32>,
+    /// Colour is already multiplied by opacity when the file has a `prem` link.
+    pub premultiplied: bool,
+}
+
+/// A decoded still image: monochrome or planar YCbCr (4:2:0, 4:2:2 or 4:4:4),
 /// `bit_depth` bits per sample, values in `0 ..= (1<<bit_depth)-1`.
-/// Colour-matrix/transfer-function conversion to RGB is the caller's
-/// job (this crate doesn't assume BT.601 vs BT.709 — see README).
+/// RGB/RGBA conversion is optional via the `to_rgb*`/`to_rgba*` methods.
 /// Clean-aperture output retains native samples: the chroma origin is the
 /// cell containing the final luma crop origin, with ceil-divided extents.
 /// Odd crop offsets do not trigger chroma interpolation or resampling.
 pub struct DecodedImage {
+    pub alpha: Option<AlphaPlane>,
     pub width: usize,
     pub height: usize,
     pub bit_depth_luma: u32,
@@ -56,6 +72,10 @@ pub struct DecodedImage {
     /// a quarter-turn of 4:2:2 has full-width, half-height chroma planes.
     /// Use `cb_width` and `cb_height` for the returned plane dimensions.
     pub chroma_format_idc: u32,
+    /// Effective container/SPS colour description; `None` means unlabelled.
+    pub color_info: Option<ColorInfo>,
+    /// Chroma positions after cropping, rotation and mirroring.
+    pub chroma_sampling: ChromaSampling,
     pub y: Vec<i32>,
     pub cb: Vec<i32>,
     pub cr: Vec<i32>,
@@ -78,6 +98,9 @@ fn find_and_parse<T>(nalus: impl Iterator<Item = impl AsRef<[u8]>>, expected_typ
 
 /// Decodes one `hvc1` item (whether it's the sole primary image or one
 /// tile of a `grid`) into its own picture.
+/// The picture retains coded padding and the SPS conformance window for
+/// reference prediction and bitstream comparisons. [`decode`] applies the
+/// window to each image before grid assembly and container transforms.
 pub fn decode_one_image(image: &ResolvedImage) -> Result<(Sps, Picture)> {
     decode_with_reference(image, None)
 }
@@ -86,8 +109,8 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
     let sps: Sps = find_and_parse(image.hevc_config.nalus_of_type(NAL_SPS), NAL_SPS, parse_sps)?;
     let pps: Pps = find_and_parse(image.hevc_config.nalus_of_type(NAL_PPS), NAL_PPS, parse_pps)?;
 
-    if !(1..=3).contains(&sps.chroma_format_idc) {
-        return Err(HeifError::Unsupported("decode: only 4:2:0, 4:2:2 and 4:4:4 chroma are supported"));
+    if sps.chroma_format_idc > 3 {
+        return Err(HeifError::Unsupported("decode: unsupported chroma format"));
     }
     if pps.sao_offset_scale[0] > sps.bit_depth_luma.saturating_sub(10)
         || pps.sao_offset_scale[1] > sps.bit_depth_chroma.saturating_sub(10) {
@@ -100,8 +123,8 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
     let length_size = image.hevc_config.length_size_minus_one as usize + 1;
     let slice_nalus = split_length_prefixed_nalus(&image.data, length_size)?;
 
-    let sub_w = sps.sub_width_c() as usize;
-    let sub_h = sps.sub_height_c() as usize;
+    let sub_w = if sps.chroma_format_idc == 0 { 0 } else { sps.sub_width_c() as usize };
+    let sub_h = if sps.chroma_format_idc == 0 { 0 } else { sps.sub_height_c() as usize };
     let mut pic = Picture::new(
         sps.pic_width_in_luma_samples as usize,
         sps.pic_height_in_luma_samples as usize,
@@ -200,22 +223,33 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
     Ok((sps, pic))
 }
 
-fn image_from_picture(sps: &Sps, pic: Picture) -> DecodedImage {
+fn image_from_picture(sps: &Sps, pic: Picture) -> Result<DecodedImage> {
     let cb_width = pic.cb.width;
     let cb_height = pic.cb.height;
-    DecodedImage {
+    let image = DecodedImage {
+        alpha: None,
         width: sps.pic_width_in_luma_samples as usize,
         height: sps.pic_height_in_luma_samples as usize,
         bit_depth_luma: sps.bit_depth_luma,
         bit_depth_chroma: sps.bit_depth_chroma,
         chroma_format_idc: sps.chroma_format_idc,
+        color_info: sps.color_info,
+        chroma_sampling: ChromaSampling::coded(sps.chroma_format_idc, sps.chroma_location),
         y: pic.y.into_samples(),
         cb: pic.cb.into_samples(),
         cr: pic.cr.into_samples(),
         cb_width,
         cb_height,
         metadata: isobmff::Metadata::default(),
-    }
+    };
+    if sps.conformance_window == [0; 4] { return Ok(image); }
+    let [left, right, top, bottom] = sps.conformance_window.map(|v| v as usize);
+    let width = image.width.checked_sub(left).and_then(|v| v.checked_sub(right)).filter(|&v| v != 0)
+        .ok_or(HeifError::MalformedHevc("SPS: conformance window exceeds picture"))?;
+    let height = image.height.checked_sub(top).and_then(|v| v.checked_sub(bottom)).filter(|&v| v != 0)
+        .ok_or(HeifError::MalformedHevc("SPS: conformance window exceeds picture"))?;
+    let (sub_w, sub_h) = chroma_subsampling(image.chroma_format_idc);
+    extract_window(image, ImageWindow { left, top, width, height }, sub_w, sub_h)
 }
 
 /// Copies `tile` into `canvas` at the raster position implied by
@@ -270,11 +304,22 @@ fn blit_tile(canvas: &mut DecodedImage, tile: &DecodedImage, tile_idx: usize, co
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     let mut parsed = isobmff::parse(bytes)?;
     let metadata = std::mem::take(&mut parsed.metadata);
-    Ok(DecodedImage { metadata, ..decode_pixels(&parsed)? })
+    let mut image = decode_pixels(&parsed)?;
+    if let Some(auxiliary) = &parsed.alpha {
+        let alpha = decode_pixels(&auxiliary.image)?;
+        if alpha.width != image.width || alpha.height != image.height {
+            return Err(HeifError::Unsupported("alpha: display dimensions do not match colour image"));
+        }
+        image.alpha = Some(AlphaPlane { bit_depth: alpha.bit_depth_luma, samples: alpha.y,
+            premultiplied: auxiliary.premultiplied });
+    }
+    image.color_info = metadata.color_info.or(image.color_info);
+    image.metadata = metadata;
+    Ok(image)
 }
 
-/// Reads the primary image's ICC profile, EXIF and XMP without decoding
-/// any pixels.
+/// Reads the primary image's ICC profile, nclx colour description, EXIF
+/// and XMP without decoding any pixels.
 pub fn read_metadata(bytes: &[u8]) -> Result<isobmff::Metadata> {
     Ok(isobmff::parse(bytes)?.metadata)
 }
@@ -294,7 +339,7 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif) -> Result<DecodedImage> {
     let Some(grid) = parsed.grid else {
         let image = parsed.images.first().ok_or(HeifError::MalformedBox("no image to decode"))?;
         let (sps, pic) = decode_with_reference(image, reference.as_ref().map(|(_, pic)| pic))?;
-        return apply_transforms(image_from_picture(&sps, pic), &parsed.transforms);
+        return apply_transforms(image_from_picture(&sps, pic)?, &parsed.transforms);
     };
 
     if parsed.images.len() != (grid.rows as usize) * (grid.columns as usize) {
@@ -318,7 +363,7 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif) -> Result<DecodedImage> {
         .par_iter()
         .map(|image| {
             let (sps, pic) = decode_one_image(image)?;
-            Ok(image_from_picture(&sps, pic))
+            image_from_picture(&sps, pic)
         })
         .collect::<Result<Vec<_>>>()?;
     let first = tiles.first().ok_or(HeifError::MalformedBox("grid has no tiles"))?;
@@ -333,14 +378,17 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif) -> Result<DecodedImage> {
     let width = grid.output_width as usize;
     let height = grid.output_height as usize;
     let (sub_w, sub_h) = chroma_subsampling(chroma_format_idc);
-    let cb_width = width.div_ceil(sub_w);
-    let cb_height = height.div_ceil(sub_h);
+    let cb_width = if chroma_format_idc == 0 { 0 } else { width.div_ceil(sub_w) };
+    let cb_height = if chroma_format_idc == 0 { 0 } else { height.div_ceil(sub_h) };
     let mut canvas = DecodedImage {
+        alpha: None,
         width,
         height,
         bit_depth_luma,
         bit_depth_chroma,
         chroma_format_idc,
+        color_info: first.color_info,
+        chroma_sampling: first.chroma_sampling,
         y: vec![0; width * height],
         cb: vec![0; cb_width * cb_height],
         cr: vec![0; cb_width * cb_height],
@@ -465,42 +513,57 @@ fn chroma_subsampling(format: u32) -> (usize, usize) {
 
 fn extract_window(img: DecodedImage, window: ImageWindow, sub_w: usize, sub_h: usize) -> Result<DecodedImage> {
     let ImageWindow { left, top, width, height } = window;
-    let cb_width = width.div_ceil(sub_w);
-    let cb_height = height.div_ceil(sub_h);
+    let cb_width = if img.chroma_format_idc == 0 { 0 } else { width.div_ceil(sub_w) };
+    let cb_height = if img.chroma_format_idc == 0 { 0 } else { height.div_ceil(sub_h) };
     let y = crop_plane(&img.y, img.width, left, top, width, height)?;
     // Native planar extraction: retain source samples, selecting chroma
     // from the cell containing the final luma origin. No interpolation.
-    let cb = crop_plane(&img.cb, img.cb_width, left / sub_w, top / sub_h, cb_width, cb_height)?;
-    let cr = crop_plane(&img.cr, img.cb_width, left / sub_w, top / sub_h, cb_width, cb_height)?;
-    Ok(DecodedImage { width, height, cb_width, cb_height, y, cb, cr, ..img })
+    let cb = if img.chroma_format_idc == 0 { Vec::new() } else { crop_plane(&img.cb, img.cb_width, left / sub_w, top / sub_h, cb_width, cb_height)? };
+    let cr = if img.chroma_format_idc == 0 { Vec::new() } else { crop_plane(&img.cr, img.cb_width, left / sub_w, top / sub_h, cb_width, cb_height)? };
+    let mut chroma_sampling = img.chroma_sampling;
+    chroma_sampling.origin_x -= (left % sub_w) as f32;
+    chroma_sampling.origin_y -= (top % sub_h) as f32;
+    Ok(DecodedImage { width, height, cb_width, cb_height, y, cb, cr, chroma_sampling, ..img })
 }
 
 fn apply_one_transform(img: DecodedImage, t: isobmff::Transform) -> Result<DecodedImage> {
-    Ok(match t {
+    let mut result = match t {
         isobmff::Transform::CleanAperture(_) => return Err(HeifError::MalformedBox("crop must be resolved as an image window")),
         isobmff::Transform::Rotate90Ccw(count) => {
             let mut img = img;
             for _ in 0..(count % 4) {
+                let sampling = img.chroma_sampling;
+                let chroma_sampling = ChromaSampling {
+                    sub_x: sampling.sub_y, sub_y: sampling.sub_x,
+                    origin_x: sampling.origin_y,
+                    origin_y: (img.width - 1) as f32 - sampling.origin_x - img.cb_width.saturating_sub(1) as f32 * sampling.sub_x as f32,
+                };
                 let (y, nw, nh) = rotate90_ccw_plane(&img.y, img.width, img.height);
                 let (cb, ncw, nch) = rotate90_ccw_plane(&img.cb, img.cb_width, img.cb_height);
                 let (cr, _, _) = rotate90_ccw_plane(&img.cr, img.cb_width, img.cb_height);
-                img = DecodedImage { width: nw, height: nh, y, cb, cr, cb_width: ncw, cb_height: nch, ..img };
+                img = DecodedImage { width: nw, height: nh, y, cb, cr, cb_width: ncw, cb_height: nch, chroma_sampling, ..img };
             }
             img
         }
         isobmff::Transform::MirrorVertical => {
+            let mut chroma_sampling = img.chroma_sampling;
+            chroma_sampling.origin_y = (img.height - 1) as f32 - chroma_sampling.origin_y - img.cb_height.saturating_sub(1) as f32 * chroma_sampling.sub_y as f32;
             let y = mirror_vertical_plane(&img.y, img.width, img.height);
             let cb = mirror_vertical_plane(&img.cb, img.cb_width, img.cb_height);
             let cr = mirror_vertical_plane(&img.cr, img.cb_width, img.cb_height);
-            DecodedImage { y, cb, cr, ..img }
+            DecodedImage { y, cb, cr, chroma_sampling, ..img }
         }
         isobmff::Transform::MirrorHorizontal => {
+            let mut chroma_sampling = img.chroma_sampling;
+            chroma_sampling.origin_x = (img.width - 1) as f32 - chroma_sampling.origin_x - img.cb_width.saturating_sub(1) as f32 * chroma_sampling.sub_x as f32;
             let y = mirror_horizontal_plane(&img.y, img.width, img.height);
             let cb = mirror_horizontal_plane(&img.cb, img.cb_width, img.cb_height);
             let cr = mirror_horizontal_plane(&img.cr, img.cb_width, img.cb_height);
-            DecodedImage { y, cb, cr, ..img }
+            DecodedImage { y, cb, cr, chroma_sampling, ..img }
         }
-    })
+    };
+    if result.chroma_format_idc == 0 { result.chroma_sampling = ChromaSampling::coded(0, None); }
+    Ok(result)
 }
 
 fn apply_transforms(mut img: DecodedImage, transforms: &[isobmff::Transform]) -> Result<DecodedImage> {
@@ -548,8 +611,10 @@ mod tests {
     #[test]
     fn rotated_422_crop_retains_vertical_chroma_subsampling() {
         let img = DecodedImage {
+            alpha: None,
             width: 8, height: 6, cb_width: 4, cb_height: 6, metadata: Default::default(),
             bit_depth_luma: 10, bit_depth_chroma: 10, chroma_format_idc: 2,
+            color_info: None, chroma_sampling: ChromaSampling::coded(2, None),
             y: (0..48).collect(), cb: (0..24).collect(), cr: (100..124).collect(),
         };
         let crop = isobmff::Transform::CleanAperture(isobmff::CleanAperture {
@@ -565,8 +630,10 @@ mod tests {
     #[test]
     fn nested_odd_crops_keep_the_original_chroma_grid() {
         let image = || DecodedImage {
+            alpha: None,
             width: 12, height: 12, cb_width: 6, cb_height: 6, metadata: Default::default(),
             bit_depth_luma: 8, bit_depth_chroma: 8, chroma_format_idc: 1,
+            color_info: None, chroma_sampling: ChromaSampling::coded(1, None),
             y: (0..144).collect(), cb: (0..36).collect(), cr: (100..136).collect(),
         };
         let crop = |size| isobmff::Transform::CleanAperture(isobmff::CleanAperture {
@@ -591,8 +658,10 @@ mod tests {
     #[test]
     fn crop_window_tracks_rotation_and_mirroring() {
         let img = DecodedImage {
+            alpha: None,
             width: 12, height: 8, cb_width: 6, cb_height: 4, metadata: Default::default(),
             bit_depth_luma: 8, bit_depth_chroma: 8, chroma_format_idc: 1,
+            color_info: None, chroma_sampling: ChromaSampling::coded(1, None),
             y: (0..96).collect(), cb: (0..24).collect(), cr: (100..124).collect(),
         };
         let crop = |w, h| isobmff::Transform::CleanAperture(isobmff::CleanAperture {
@@ -633,8 +702,10 @@ mod tests {
     #[test]
     fn crop_precedes_rotation_and_preserves_chroma_planes() {
         let img = DecodedImage {
+            alpha: None,
             width: 8, height: 4, cb_width: 4, cb_height: 2, metadata: Default::default(),
             bit_depth_luma: 8, bit_depth_chroma: 8, chroma_format_idc: 1,
+            color_info: None, chroma_sampling: ChromaSampling::coded(1, None),
             y: (0..32).collect(), cb: (100..108).collect(), cr: (200..208).collect(),
         };
         let aperture = isobmff::CleanAperture {

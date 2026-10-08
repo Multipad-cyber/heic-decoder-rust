@@ -119,11 +119,13 @@ pub fn apply_sao(pic: &mut Picture, sps: &Sps, sao_luma: bool, sao_chroma: bool)
     let ctb_pixel = 1usize << pic.ctb_log2;
     let (pic_width_ctbs, pic_height_ctbs) = (pic.pic_width_ctbs(), pic.pic_height_ctbs());
     let sao = pic.sao_params().to_vec();
+    let restore_bypass = pic.has_bypass();
 
     if sao_luma {
         let (width, height) = (pic.y.width, pic.y.height);
         let snapshot = pic.y.samples().to_vec();
         apply_component(&sao, pic_width_ctbs, pic_height_ctbs, 0, width, height, ctb_pixel, ctb_pixel, pic.y.bit_depth, &snapshot, pic.y.samples_mut());
+        if restore_bypass { pic.restore_bypass(0, &snapshot, 1, 1); }
     }
     if sao_chroma && sps.chroma_format_idc != 0 {
         let chroma_ctb_width = ctb_pixel / sps.sub_width_c() as usize;
@@ -132,10 +134,12 @@ pub fn apply_sao(pic: &mut Picture, sps: &Sps, sao_luma: bool, sao_chroma: bool)
         let (cb_width, cb_height) = (pic.cb.width, pic.cb.height);
         let snapshot_cb = pic.cb.samples().to_vec();
         apply_component(&sao, pic_width_ctbs, pic_height_ctbs, 1, cb_width, cb_height, chroma_ctb_width, chroma_ctb_height, pic.cb.bit_depth, &snapshot_cb, pic.cb.samples_mut());
+        if restore_bypass { pic.restore_bypass(1, &snapshot_cb, sps.sub_width_c() as usize, sps.sub_height_c() as usize); }
 
         let (cr_width, cr_height) = (pic.cr.width, pic.cr.height);
         let snapshot_cr = pic.cr.samples().to_vec();
         apply_component(&sao, pic_width_ctbs, pic_height_ctbs, 2, cr_width, cr_height, chroma_ctb_width, chroma_ctb_height, pic.cr.bit_depth, &snapshot_cr, pic.cr.samples_mut());
+        if restore_bypass { pic.restore_bypass(2, &snapshot_cr, sps.sub_width_c() as usize, sps.sub_height_c() as usize); }
     }
     Ok(())
 }
@@ -143,6 +147,21 @@ pub fn apply_sao(pic: &mut Picture, sps: &Sps, sao_luma: bool, sao_chroma: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bypass_samples_keep_their_values_while_neighbours_receive_sao() {
+        let mut pic = Picture::new(8, 4, 2, 2, 8, 8, 3, 4);
+        pic.y.samples_mut().fill(10);
+        pic.mark_bypass(0, 0, 4, true);
+        let snapshot = pic.y.samples().to_vec();
+        let mut params = SaoCtbParams::default();
+        params.type_idx[0] = 1;
+        params.extra[0] = 1;
+        params.offsets[0] = [3, 0, 0, 0];
+        apply_component(&[params], 1, 1, 0, 8, 4, 16, 16, 8, &snapshot, pic.y.samples_mut());
+        pic.restore_bypass(0, &snapshot, 1, 1);
+        for y in 0..4 { for x in 0..8 { assert_eq!(pic.y.sample(x, y), Some(if x < 4 { 10 } else { 13 })); } }
+    }
 
     /// 8-bit band offset: `band = sample >> 3`, so samples 10/40/70/100
     /// land in bands 1/5/8/12. With `band_position = 1`, only bands

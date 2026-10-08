@@ -347,8 +347,17 @@ pub struct SequenceFrameInfo {
     pub sample_count: u32,
 }
 
+/// Resolved auxiliary alpha image. Its own transforms are applied separately.
+#[derive(Debug, Clone)]
+pub struct AuxiliaryAlpha {
+    pub image: Box<ParsedHeif>,
+    /// `prem` links the colour image to this alpha image.
+    pub premultiplied: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct ParsedHeif {
+    pub alpha: Option<AuxiliaryAlpha>,
     /// Single coded reference image for the restricted IDR-to-P path.
     pub reference_image: Option<ResolvedImage>,
     /// Present when returning a sequence preview rather than a still item.
@@ -373,6 +382,9 @@ pub struct ParsedHeif {
 /// decode.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Metadata {
+    /// Coding-independent colour description from `colr/nclx`, if present.
+    /// ICC profiles are retained separately; they do not replace the YCbCr matrix.
+    pub color_info: Option<crate::color::ColorInfo>,
     /// ICC colour profile from the image's `colr` property (`prof` or `rICC`).
     pub icc_profile: Option<Vec<u8>>,
     /// EXIF data starting at its TIFF header (`II*\0` or `MM\0*`).
@@ -405,7 +417,9 @@ pub fn split_length_prefixed_nalus(data: &[u8], length_size: usize) -> Result<Ve
 
 /// Parses a HEIF file, resolving the primary image item's HEVC
 /// configuration and coded sample bytes.
-pub fn parse(file: &[u8]) -> Result<ParsedHeif> {
+pub fn parse(file: &[u8]) -> Result<ParsedHeif> { parse_selected(file, None, true) }
+
+fn parse_selected(file: &[u8], selected: Option<u32>, include_alpha: bool) -> Result<ParsedHeif> {
     let mut saw_ftyp = false;
     let mut meta_body_range: Option<(usize, usize)> = None;
     let mut moov_body_range = None;
@@ -518,10 +532,13 @@ pub fn parse(file: &[u8]) -> Result<ParsedHeif> {
         Ok(())
     })?;
 
-    let primary_item_id = primary_item_id.ok_or(HeifError::NotHeif("missing pitm box"))?;
+    let primary_item_id = selected.or(primary_item_id).ok_or(HeifError::NotHeif("missing pitm box"))?;
     let iloc = iloc.ok_or(HeifError::NotHeif("missing iloc box"))?;
 
     let chain = identity_chain(&item_types, iref_body.as_deref(), primary_item_id)?;
+    let alpha = if include_alpha {
+        resolve_alpha(file, &item_types, &ipma, &ipco_kinds, &ipco_bodies, iref_body.as_deref(), &chain)?
+    } else { None };
     let source_id = *chain.last().ok_or(HeifError::MalformedBox("empty image reference chain"))?;
     // Source transforms apply first, then each enclosing identity item.
     let mut transforms = Vec::new();
@@ -550,6 +567,7 @@ pub fn parse(file: &[u8]) -> Result<ParsedHeif> {
     let metadata_item = |candidates: &[u32]| describing_item(candidates, iref_body.as_deref(), &chain)
         .and_then(|id| resolve_item_bytes(file, &idat, &iloc, id).ok());
     let mut metadata = Metadata {
+        color_info: resolve_color_info(&ipma, &ipco_kinds, &ipco_bodies, &chain)?,
         icc_profile: resolve_icc(&ipma, &ipco_kinds, &ipco_bodies, &chain),
         exif: metadata_item(&exif_items).and_then(|payload| exif_tiff(&payload)),
         xmp: metadata_item(&xmp_items),
@@ -558,7 +576,7 @@ pub fn parse(file: &[u8]) -> Result<ParsedHeif> {
         Some(b"hvc1") => {
             let hevc_config = resolve_hvcc(&ipma, &ipco_kinds, &ipco_bodies, source_id)?;
             let data = resolve_item_bytes(file, &idat, &iloc, source_id)?;
-            Ok(ParsedHeif { reference_image, sequence: None, primary_item_id, grid: None, images: vec![ResolvedImage { hevc_config, data }], transforms, metadata })
+            Ok(ParsedHeif { alpha, reference_image, sequence: None, primary_item_id, grid: None, images: vec![ResolvedImage { hevc_config, data }], transforms, metadata })
         }
         Some(b"grid") => {
             let grid_bytes = resolve_item_bytes(file, &idat, &iloc, source_id)?;
@@ -584,11 +602,93 @@ pub fn parse(file: &[u8]) -> Result<ParsedHeif> {
             if metadata.icc_profile.is_none() {
                 metadata.icc_profile = resolve_icc(&ipma, &ipco_kinds, &ipco_bodies, &tile_ids);
             }
-            Ok(ParsedHeif { reference_image, sequence: None, primary_item_id, grid: Some(grid_info), images, transforms, metadata })
+            if metadata.color_info.is_none() {
+                metadata.color_info = resolve_color_info(&ipma, &ipco_kinds, &ipco_bodies, &tile_ids)?;
+            }
+            Ok(ParsedHeif { alpha, reference_image, sequence: None, primary_item_id, grid: Some(grid_info), images, transforms, metadata })
         }
         Some(_) => Err(HeifError::Unsupported("resolved image item is not type 'hvc1' or 'grid'")),
         None => Err(HeifError::MalformedBox("primary item has no iinf entry")),
     }
+}
+
+fn auxiliary_links(body: &[u8], wanted: &[u8; 4]) -> Result<BTreeMap<u32, Vec<u32>>> {
+    let mut r = ByteReader::new(body);
+    let (version, _) = full_box_header(&mut r)?;
+    if version > 1 { return Err(HeifError::Unsupported("iref: version")); }
+    let mut links = BTreeMap::new();
+    for_each_child(body, r.pos(), body.len(), 0, |kind, data| {
+        if kind != wanted { return Ok(()); }
+        let mut entry = ByteReader::new(data);
+        while entry.remaining() > 0 {
+            let from = if version == 0 { u32::from(entry.u16()?) } else { entry.u32()? };
+            let count = entry.u16()?;
+            let mut targets = Vec::with_capacity(count as usize);
+            for _ in 0..count { targets.push(if version == 0 { u32::from(entry.u16()?) } else { entry.u32()? }); }
+            if links.insert(from, targets).is_some() { return Err(HeifError::MalformedBox("iref: duplicate auxiliary reference")); }
+        }
+        Ok(())
+    })?;
+    Ok(links)
+}
+
+// Alpha is identified by its auxiliary type AND an auxl link to the selected
+// image/identity chain. Depth maps and unrelated auxiliary images are ignored.
+#[allow(clippy::too_many_arguments)]
+fn resolve_alpha(file: &[u8], types: &BTreeMap<u32, [u8; 4]>, ipma: &BTreeMap<u32, Vec<u32>>,
+                 kinds: &[[u8; 4]], bodies: &[Vec<u8>], references: Option<&[u8]>, chain: &[u32]) -> Result<Option<AuxiliaryAlpha>> {
+    let Some(references) = references else { return Ok(None); };
+    let links = auxiliary_links(references, b"auxl")?;
+    let mut selected = None;
+    for (&id, targets) in &links {
+        if !targets.iter().any(|target| chain.contains(target)) { continue; }
+        let mut is_alpha = false;
+        for &property in ipma.get(&id).into_iter().flatten() {
+            let Some(index) = (property as usize).checked_sub(1) else { continue; };
+            if kinds.get(index) != Some(b"auxC") { continue; }
+            let body = bodies.get(index).ok_or(HeifError::MalformedBox("auxC: property out of bounds"))?;
+            let mut r = ByteReader::new(body);
+            let (version, _) = full_box_header(&mut r)?;
+            if version != 0 { return Err(HeifError::Unsupported("auxC: version")); }
+            let urn = r.c_string()?;
+            is_alpha |= matches!(urn, b"urn:mpeg:hevc:2015:auxid:1" | b"urn:mpeg:avc:2015:auxid:1"
+                | b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha");
+        }
+        if !is_alpha { continue; }
+        if chain.contains(&id) { return Err(HeifError::MalformedBox("alpha: self reference")); }
+        if selected.replace(id).is_some() { return Err(HeifError::Unsupported("alpha: multiple auxiliary alpha images")); }
+    }
+    let Some(id) = selected else { return Ok(None); };
+    if identity_chain(types, Some(references), id)?.iter().any(|source| chain.contains(source)) {
+        return Err(HeifError::MalformedBox("alpha: cyclic identity reference"));
+    }
+    let prem_links = auxiliary_links(references, b"prem")?;
+    let premultiplied = chain.iter().any(|master| prem_links.get(master).is_some_and(|targets| targets.contains(&id)));
+    // One bounded reparse reuses the same grid/identity validation. Nested
+    // auxiliaries are deliberately not traversed, avoiding recursive cycles.
+    let image = parse_selected(file, Some(id), false)?;
+    Ok(Some(AuxiliaryAlpha { image: Box::new(image), premultiplied }))
+}
+
+pub(super) fn parse_nclx(body: &[u8]) -> Result<Option<crate::color::ColorInfo>> {
+    if !body.starts_with(b"nclx") { return Ok(None); }
+    let mut r = ByteReader::new(body);
+    r.skip(4)?;
+    Ok(Some(crate::color::ColorInfo {
+        color_primaries: r.u16()?, transfer_characteristics: r.u16()?,
+        matrix_coefficients: r.u16()?, full_range: r.u8()? & 0x80 != 0,
+    }))
+}
+
+fn resolve_color_info(ipma: &BTreeMap<u32, Vec<u32>>, kinds: &[[u8; 4]], bodies: &[Vec<u8>], items: &[u32]) -> Result<Option<crate::color::ColorInfo>> {
+    for &index in items.iter().filter_map(|item| ipma.get(item)).flatten() {
+        let Some(i) = (index as usize).checked_sub(1) else { continue; };
+        if kinds.get(i) == Some(b"colr") {
+            let body = bodies.get(i).ok_or(HeifError::MalformedBox("colr: property out of bounds"))?;
+            if let Some(color) = parse_nclx(body)? { return Ok(Some(color)); }
+        }
+    }
+    Ok(None)
 }
 
 /// The first `colr` ICC profile (`prof` or `rICC`) associated with `items`.
@@ -786,6 +886,29 @@ mod tests {
         out
     }
 
+    #[test]
+    fn auxiliary_alpha_rejects_self_cycles_duplicates_and_multiple_planes() {
+        let reference = |kind: &[u8; 4], from: u16, to: u16| {
+            box_(kind, &[from.to_be_bytes(), 1u16.to_be_bytes(), to.to_be_bytes()].concat())
+        };
+        let types = BTreeMap::from([(1, *b"hvc1"), (2, *b"iden"), (3, *b"hvc1")]);
+        let ipma = BTreeMap::from([(1, vec![1]), (2, vec![1]), (3, vec![1])]);
+        let kinds = [*b"auxC"];
+        let bodies = [full_box_body(0, 0, b"urn:mpeg:hevc:2015:auxid:1\0")];
+        for entries in [
+            reference(b"auxl", 1, 1),
+            [reference(b"auxl", 2, 1), reference(b"dimg", 2, 1)].concat(),
+            [reference(b"auxl", 2, 1), reference(b"auxl", 2, 1)].concat(),
+            [reference(b"auxl", 2, 1), reference(b"auxl", 3, 1)].concat(),
+        ] {
+            let body = full_box_body(0, 0, &entries);
+            assert!(resolve_alpha(&[], &types, &ipma, &kinds, &bodies, Some(&body), &[1]).is_err());
+        }
+        // Version 1 references use 32-bit IDs rather than silently truncating.
+        let body = full_box_body(1, 0, &box_(b"auxl", &[65537u32.to_be_bytes().as_slice(), 1u16.to_be_bytes().as_slice(), 1u32.to_be_bytes().as_slice()].concat()));
+        assert_eq!(auxiliary_links(&body, b"auxl").unwrap().get(&65537), Some(&vec![1]));
+    }
+
     /// Builds a minimal, synthetic (not real-world) HEIC-shaped file with one
     /// `hvc1` primary item whose coded data is a single fake NAL, purely to
     /// exercise the container parser end to end.
@@ -972,6 +1095,21 @@ mod tests {
         let ipma = BTreeMap::from([(1, vec![1, 3]), (2, vec![1, 2])]);
         assert_eq!(resolve_icc(&ipma, &kinds, &bodies, &[1]), None);
         assert_eq!(resolve_icc(&ipma, &kinds, &bodies, &[1, 2]), Some(b"ICCDATA".to_vec()));
+    }
+
+    #[test]
+    fn nclx_colour_uses_item_precedence_and_rejects_truncated_data() {
+        let kinds = vec![*b"colr", *b"colr", *b"colr"];
+        let bodies = vec![b"profICC".to_vec(), b"nclx\0\x09\0\x10\0\x09\x80".to_vec(), b"nclx\0\x01\0\x0d\0\x06\0".to_vec()];
+        let associations = BTreeMap::from([(1, vec![1, 2]), (2, vec![3])]);
+        let colour = resolve_color_info(&associations, &kinds, &bodies, &[2, 1]).unwrap().unwrap();
+        assert_eq!((colour.color_primaries, colour.transfer_characteristics, colour.matrix_coefficients, colour.full_range), (1, 13, 6, false));
+        assert_eq!(resolve_icc(&associations, &kinds, &bodies, &[2, 1]), Some(b"ICC".to_vec()));
+        for length in 4..11 { assert!(parse_nclx(&bodies[1][..length]).is_err()); }
+        assert_eq!(parse_nclx(b"profICC").unwrap(), None);
+        // Keep unsupported code points visible to the optional converter;
+        // the planar decoder does not need a colour matrix.
+        assert_eq!(parse_nclx(b"nclx\0\x02\0\x02\0\x0e\x80").unwrap().unwrap().matrix_coefficients, 14);
     }
 
     #[test]

@@ -4,16 +4,21 @@
 //! - `container_parse`: parse ISOBMFF without decoding pixels
 //! - `decode_file`: full decode from bytes → planar YUV
 //!
-//! Run with: `cargo bench --bench decode`
+//! The inputs are not bundled. Point `HEIF_CONFORMANCE_DIR` at the Nokia
+//! conformance files (<https://github.com/nokiatech/heif_conformance>);
+//! the benchmarks use C001 and C013 and skip files that are missing.
+//!
+//! Run with: `HEIF_CONFORMANCE_DIR=/path/to/conformance_files cargo bench --bench decode`
 //! Run specific group: `cargo bench --bench decode -- container_parse`
-//! Generate HTML reports: `cargo bench --bench decode -- --verbose`
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 use std::fs;
 
+const FILES: [&str; 2] = ["C001.heic", "C013.heic"];
+
 fn fixture(name: &str) -> Option<Vec<u8>> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/");
-    fs::read(format!("{path}{name}")).ok()
+    let dir = std::env::var_os("HEIF_CONFORMANCE_DIR")?;
+    fs::read(std::path::Path::new(&dir).join(name)).ok()
 }
 
 /// ISOBMFF container parsing: walk boxes, find primary item, read properties.
@@ -22,10 +27,7 @@ fn container_parse(c: &mut Criterion) {
     let mut group = c.benchmark_group("container_parse");
     group.sample_size(10);
 
-    for name in [
-        "photo-1024.heic",
-        "photo-2048.heic",
-    ] {
+    for name in FILES {
         if let Some(bytes) = fixture(name) {
             group.bench_function(name, |b| {
                 b.iter(|| heic_decoder_rust::isobmff::parse(black_box(&bytes)))
@@ -42,10 +44,7 @@ fn decode_file(c: &mut Criterion) {
     group.sample_size(10);
     group.measurement_time(std::time::Duration::from_secs(30)); // Longer measurement for slow operations
 
-    for name in [
-        "photo-1024.heic",
-        "photo-2048.heic",
-    ] {
+    for name in FILES {
         if let Some(bytes) = fixture(name) {
             // Measure throughput in pixels decoded
             if let Ok(img) = heic_decoder_rust::decode(&bytes) {

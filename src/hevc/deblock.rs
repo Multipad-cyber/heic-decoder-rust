@@ -84,6 +84,8 @@ fn filter_luma_segment(pic: &mut Picture, x: usize, y: usize, vertical: bool, be
     let bs = pic.boundary_strength(qx,qy,vertical);
     if bs == 0 { return Ok(()); }
 
+    let protect_p = pic.bypass_at(px, py);
+    let protect_q = pic.bypass_at(qx, qy);
     let qp_p = pic.qp_y_at(px, py).unwrap_or(0);
     let qp_q = pic.qp_y_at(qx, qy).unwrap_or(0);
     let qp_l = (qp_p + qp_q + 1) >> 1;
@@ -139,8 +141,8 @@ fn filter_luma_segment(pic: &mut Picture, x: usize, y: usize, vertical: bool, be
             let q0_f = clip3(q0 - tc2, q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(0, max_val);
             let q1_f = clip3(q1 - tc2, q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2).clamp(0, max_val);
             let q2_f = clip3(q2 - tc2, q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(0, max_val);
-            write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f, p1_f, p2_f]);
-            write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f, q1_f, q2_f]);
+            if !protect_p { write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f, p1_f, p2_f]); }
+            if !protect_q { write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f, q1_f, q2_f]); }
         } else {
             let delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
             if delta.abs() >= 10 * tc {
@@ -161,14 +163,15 @@ fn filter_luma_segment(pic: &mut Picture, x: usize, y: usize, vertical: bool, be
             } else {
                 None
             };
-            match p1_f {
+            if !protect_p { match p1_f {
                 Some(p1_f) => write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f, p1_f]),
                 None => write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f]),
             }
-            match q1_f {
+            }
+            if !protect_q { match q1_f {
                 Some(q1_f) => write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f, q1_f]),
                 None => write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f]),
-            }
+            } }
         }
     }
     Ok(())
@@ -200,7 +203,7 @@ fn chroma_tc(pic: &Picture, lx: i64, ly: i64, vertical: bool, tc_offset: i32, qp
 
 /// Filters one chroma sample pair across an edge (clause 8.7.2.5.5):
 /// one modified sample on each side, no strong/weak distinction.
-fn filter_chroma_pixels(plane: &mut Plane, cx: i64, cy: i64, vertical: bool, tc: i32) {
+fn filter_chroma_pixels(plane: &mut Plane, cx: i64, cy: i64, vertical: bool, tc: i32, protect_p: bool, protect_q: bool) {
     let max_val = (1i32 << plane.bit_depth) - 1;
     let (dxp0, dyp0, dxp1, dyp1, dxq0, dyq0, dxq1, dyq1) = if vertical { (-1, 0, -2, 0, 0, 0, 1, 0) } else { (0, -1, 0, -2, 0, 0, 0, 1) };
     let read = |plane: &Plane, dx: i64, dy: i64| -> Option<i32> { plane.sample(usize::try_from(cx + dx).ok()?, usize::try_from(cy + dy).ok()?) };
@@ -211,10 +214,10 @@ fn filter_chroma_pixels(plane: &mut Plane, cx: i64, cy: i64, vertical: bool, tc:
     let delta = clip3(-tc, tc, (((q0 - p0) << 2) + p1 - q1 + 4) >> 3);
     let p0_f = (p0 + delta).clamp(0, max_val);
     let q0_f = (q0 - delta).clamp(0, max_val);
-    if let (Ok(x), Ok(y)) = (usize::try_from(cx + dxp0), usize::try_from(cy + dyp0)) {
+    if !protect_p && let (Ok(x), Ok(y)) = (usize::try_from(cx + dxp0), usize::try_from(cy + dyp0)) {
         plane.set_sample(x, y, p0_f);
     }
-    if let (Ok(x), Ok(y)) = (usize::try_from(cx + dxq0), usize::try_from(cy + dyq0)) {
+    if !protect_q && let (Ok(x), Ok(y)) = (usize::try_from(cx + dxq0), usize::try_from(cy + dyq0)) {
         plane.set_sample(x, y, q0_f);
     }
 }
@@ -274,11 +277,13 @@ pub fn deblock_picture(pic: &mut Picture, sps: &Sps, beta_offset_div2: i32, tc_o
             let mut ly = 0usize;
             while ly < height {
                 if let Some(tc) = chroma_tc(pic, lx as i64, ly as i64, true, tc_offset, qp_offset, sps.chroma_format_idc, bit_depth_chroma) {
+                    let protect_p = pic.bypass_at(lx as i64 - 1, ly as i64);
+                    let protect_q = pic.bypass_at(lx as i64, ly as i64);
                     let plane = if cb { &mut pic.cb } else { &mut pic.cr };
                     let cx = (lx / sub_w) as i64;
                     let cy0 = (ly / sub_h) as i64;
                     for dy in 0..seg_h_chroma as i64 {
-                        filter_chroma_pixels(plane, cx, cy0 + dy, true, tc);
+                        filter_chroma_pixels(plane, cx, cy0 + dy, true, tc, protect_p, protect_q);
                     }
                 }
                 ly += y_step_vert;
@@ -290,11 +295,13 @@ pub fn deblock_picture(pic: &mut Picture, sps: &Sps, beta_offset_div2: i32, tc_o
             let mut lx = 0usize;
             while lx < width {
                 if let Some(tc) = chroma_tc(pic, lx as i64, ly as i64, false, tc_offset, qp_offset, sps.chroma_format_idc, bit_depth_chroma) {
+                    let protect_p = pic.bypass_at(lx as i64, ly as i64 - 1);
+                    let protect_q = pic.bypass_at(lx as i64, ly as i64);
                     let plane = if cb { &mut pic.cb } else { &mut pic.cr };
                     let cx0 = (lx / sub_w) as i64;
                     let cy = (ly / sub_h) as i64;
                     for dx in 0..seg_w_chroma as i64 {
-                        filter_chroma_pixels(plane, cx0 + dx, cy, false, tc);
+                        filter_chroma_pixels(plane, cx0 + dx, cy, false, tc, protect_p, protect_q);
                     }
                 }
                 lx += x_step_horiz;
@@ -312,6 +319,26 @@ mod tests {
 
     fn test_picture(width: usize, height: usize) -> Picture {
         Picture::new(width, height, 2, 2, 8, 8, 3, 4)
+    }
+
+    #[test]
+    fn bypass_preserves_either_side_without_disabling_the_other() {
+        for protect_p in [false, true] {
+            let mut pic = test_picture(8, 4);
+            for y in 0..4 { for x in 0..8 { pic.y.set_sample(x, y, if x < 4 { 100 } else { 110 }); } }
+            pic.set_qp_y(0, 0, 8, 37);
+            pic.mark_cu_edges(4, 0, 4);
+            pic.mark_bypass(if protect_p { 0 } else { 4 }, 0, 4, true);
+            filter_luma_segment(&mut pic, 4, 0, true, 0, 0).unwrap();
+            assert_eq!(pic.y.sample(3, 0), Some(if protect_p { 100 } else { 104 }));
+            assert_eq!(pic.y.sample(4, 0), Some(if protect_p { 106 } else { 110 }));
+            let mut other = test_picture(8, 2);
+            let plane = &mut other.cb;
+            for x in 0..4 { plane.set_sample(x, 0, if x < 2 { 100 } else { 110 }); }
+            filter_chroma_pixels(plane, 2, 0, true, 5, protect_p, !protect_p);
+            assert_eq!(plane.sample(1, 0), Some(if protect_p { 100 } else { 104 }));
+            assert_eq!(plane.sample(2, 0), Some(if protect_p { 106 } else { 110 }));
+        }
     }
 
     /// Flat regions of 100 (p-side) and 110 (q-side) either side of a
@@ -398,7 +425,7 @@ mod tests {
         pic.cb.set_sample(1, 0, 100);
         pic.cb.set_sample(2, 0, 110);
         pic.cb.set_sample(3, 0, 120);
-        filter_chroma_pixels(&mut pic.cb, 2, 0, true, 5);
+        filter_chroma_pixels(&mut pic.cb, 2, 0, true, 5, false, false);
         assert_eq!(pic.cb.sample(1, 0), Some(101));
         assert_eq!(pic.cb.sample(2, 0), Some(109));
         // Untouched: chroma deblocking only ever edits p0/q0.
@@ -421,6 +448,8 @@ mod tests {
             chroma_format_idc: 1,
             pic_width_in_luma_samples: 24,
             pic_height_in_luma_samples: 8,
+            conformance_window: [0; 4],
+            color_info: None, chroma_location: None,
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             log2_min_luma_coding_block_size: 3,

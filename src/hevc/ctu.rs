@@ -3,9 +3,8 @@
 //! together CABAC, intra prediction, dequant/transform and residual
 //! coding into reconstructed pixels.
 //!
-//! Scope cuts (all enforced as `Unsupported`, never mis-decoded):
-//! intra `PART_2Nx2N`/`PART_NxN`, no
-//! `cu_transquant_bypass`, no PCM. The `split_cu_flag` boundary-forced-
+//! Intra `PART_2Nx2N`/`PART_NxN` and basic CU transquant bypass are
+//! supported; PCM is rejected. The `split_cu_flag` boundary-forced-
 //! split rule and the chroma-follows-parent-CU rule at 4x4 luma leaves
 //! were checked against `libde265`'s `slice.cc` (LGPL-3.0). See the
 //! crate README.
@@ -105,6 +104,7 @@ pub struct Picture {
     motions: Vec<Option<Motion>>,
     skips: Vec<bool>,
     luma_residual: Vec<bool>,
+    bypass: Vec<bool>,
     pub y: Plane,
     pub cb: Plane,
     pub cr: Plane,
@@ -145,8 +145,8 @@ pub struct Picture {
 impl Picture {
     #[allow(clippy::too_many_arguments)]
     pub fn new(width: usize, height: usize, sub_w: usize, sub_h: usize, bit_depth_luma: u32, bit_depth_chroma: u32, min_cb_log2: u32, ctb_log2: u32) -> Self {
-        let cw = width.div_ceil(sub_w);
-        let ch = height.div_ceil(sub_h);
+        let cw = if sub_w == 0 { 0 } else { width.div_ceil(sub_w) };
+        let ch = if sub_h == 0 { 0 } else { height.div_ceil(sub_h) };
         let min_pu_width = width.div_ceil(4);
         let min_pu_height = height.div_ceil(4);
         let min_cb_width = width.div_ceil(1 << min_cb_log2);
@@ -157,7 +157,7 @@ impl Picture {
         Picture {
             slice_start_y: 0,
             motions: vec![None; min_pu_count], skips: vec![false; min_pu_count],
-            luma_residual: vec![false; min_pu_count],
+            luma_residual: vec![false; min_pu_count], bypass: vec![false; min_pu_count],
             y: Plane::new(width, height, bit_depth_luma),
             cb: Plane::new(cw, ch, bit_depth_chroma),
             cr: Plane::new(cw, ch, bit_depth_chroma),
@@ -176,6 +176,28 @@ impl Picture {
             ctb_log2,
             pic_width_ctbs,
             pic_height_ctbs,
+        }
+    }
+
+    pub(crate) fn bypass_at(&self, x: i64, y: i64) -> bool {
+        self.min_pu_index(x, y).and_then(|i| self.bypass.get(i)).copied().unwrap_or(false)
+    }
+    pub(crate) fn mark_bypass(&mut self, x: usize, y: usize, size: usize, value: bool) {
+        for row in (y..(y + size).min(self.y.height)).step_by(4) {
+            for col in (x..(x + size).min(self.y.width)).step_by(4) {
+                if let Some(i) = self.min_pu_index(col as i64, row as i64) { self.bypass[i] = value; }
+            }
+        }
+    }
+    pub(crate) fn has_bypass(&self) -> bool { self.bypass.iter().any(|&b| b) }
+    /// SAO reads the original raster; restore protected samples after its pass.
+    pub(crate) fn restore_bypass(&mut self, cidx: usize, snapshot: &[i32], sub_w: usize, sub_h: usize) {
+        let width = match cidx { 0 => self.y.width, 1 => self.cb.width, _ => self.cr.width };
+        for (i, &sample) in snapshot.iter().enumerate() {
+            if self.bypass_at(((i % width) * sub_w) as i64, ((i / width) * sub_h) as i64) {
+                let plane = match cidx { 0 => &mut self.y, 1 => &mut self.cb, _ => &mut self.cr };
+                if let Some(out) = plane.samples_mut().get_mut(i) { *out = sample; }
+            }
         }
     }
 
@@ -364,6 +386,7 @@ struct Decoder<'e, 'b, 'c> {
     reference: Option<&'c Picture>,
     inter: Option<&'c InterSlice>,
     current_intra: bool,
+    transquant_bypass: bool,
     inter_partition_split: bool,
     engine: &'e mut Engine<'b, 'c>,
     ctxs: Contexts,
@@ -733,11 +756,9 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
     fn coding_unit(&mut self, pic: &mut Picture, x0: usize, y0: usize, log2_cb_size: u32) -> Result<()> {
         let size = 1usize << log2_cb_size;
 
-        if self.pps.transquant_bypass_enabled {
-            // cu_transquant_bypass_flag would be signaled here; this
-            // decoder doesn't support it (see module docs).
-            return Err(HeifError::Unsupported("coding_unit: transquant_bypass_enabled PPS not supported"));
-        }
+        self.transquant_bypass = self.pps.transquant_bypass_enabled
+            && self.engine.decision(&mut self.ctxs.transquant_bypass[0])? != 0;
+        pic.mark_bypass(x0, y0, size, self.transquant_bypass);
 
         self.current_intra = true;
         self.inter_partition_split = false;
@@ -799,14 +820,14 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 let luma = pic.intra_mode_at((x0 + dx) as i64, (y0 + dy) as i64).ok_or(HeifError::MalformedHevc("chroma: missing luma PU mode"))?;
                 chroma_modes[i] = self.decode_chroma_mode(luma)?;
             }
-        } else {
+        } else if self.sps.chroma_format_idc != 0 {
             chroma_modes.fill(self.decode_chroma_mode(luma_mode_0)?);
         }
 
         // Delta presence is tracked across all CUs in the quantization
         // group, initialized by coding_quadtree rather than by each CU.
 
-        self.transform_tree(pic, x0, y0, x0, y0, log2_cb_size, 0, [true; 2], [true; 2], chroma_modes, part_nxn)?;
+        self.transform_tree(pic, x0, y0, x0, y0, log2_cb_size, 0, [self.sps.chroma_format_idc != 0; 2], [self.sps.chroma_format_idc != 0; 2], chroma_modes, part_nxn)?;
 
         // Deblocking bookkeeping (clause 8.7.2.4): this CU's whole area
         // used `self.qp_y_prev`'s final value as its `QpY`, whether or
@@ -1059,7 +1080,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 // encoder actually uses it on a 4x4 TU — this doesn't
                 // show up on any Apple-encoded real photo tested so far,
                 // only on non-Apple-encoded HEIF conformance files.
-                let transform_skip = if self.pps.transform_skip_enabled && nt == 4 {
+                let transform_skip = if !self.transquant_bypass && self.pps.transform_skip_enabled && nt == 4 {
                     let ctx_idx = if cidx == 0 { 0 } else { 1 };
                     let model = self.ctxs.transform_skip_flag.get_mut(ctx_idx).ok_or(HeifError::MalformedHevc("transform_skip_flag: context index"))?;
                     self.engine.decision(model)? == 1
@@ -1068,34 +1089,38 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 };
                 let intra_pred_mode = if self.current_intra { mode as u32 } else { 0 };
                 let coeffs = block(&mut scratch.coeffs, nt)?;
-                decode_residual(self.engine, &mut self.ctxs, log2_size, cidx, intra_pred_mode, is_luma_or_444, self.pps.sign_data_hiding_enabled, coeffs)?;
-                let qp = if cidx == 0 {
-                    self.qp_y_prev + 6 * (self.sps.bit_depth_luma as i32 - 8)
-                } else {
-                    // Clause 8.6.1: qPi -> QpCb/QpCr. `QpBdOffsetC` is 0
-                    // for the 8-bit-chroma streams this decoder has been
-                    // validated against; included anyway since it's a
-                    // one-line generalization for higher bit depths.
-                    let offset = if cidx == 1 { self.pps.cb_qp_offset + self.slice_cb_qp_offset } else { self.pps.cr_qp_offset + self.slice_cr_qp_offset };
-                    let qp_bd_offset_c = 6 * (self.sps.bit_depth_chroma as i32 - 8);
-                    let qp_i = (self.qp_y_prev + offset).clamp(-qp_bd_offset_c, 57);
-                    let qp_c = if self.sps.chroma_format_idc == 1 { chroma_qp_mapping(qp_i) } else { qp_i.min(51) };
-                    qp_c + qp_bd_offset_c
-                };
-                let dequantized = block(&mut scratch.dequantized, nt)?;
-                for (i, (o, &c)) in dequantized.iter_mut().zip(coeffs.iter()).enumerate() {
-                    let weight = match self.scaling_list {
-                        Some(list) => list.weight(log2_size, cidx, i % nt, i / nt)?,
-                        None => 16,
-                    };
-                    *o = dequant_with_scale(c, qp, bit_depth, log2_size, weight)?;
-                }
+                decode_residual(self.engine, &mut self.ctxs, log2_size, cidx, intra_pred_mode, is_luma_or_444, self.pps.sign_data_hiding_enabled && !self.transquant_bypass, coeffs)?;
                 let res = block(&mut scratch.residual, nt)?;
-                if transform_skip {
-                    transform_skip_residual(dequantized, nt, bit_depth, res)?;
+                if self.transquant_bypass {
+                    res.copy_from_slice(coeffs);
                 } else {
-                    let use_dst = self.current_intra && cidx == 0 && nt == 4;
-                    inverse_transform(dequantized, nt, bit_depth, use_dst, &mut scratch.transform_tmp, res)?;
+                    let qp = if cidx == 0 {
+                        self.qp_y_prev + 6 * (self.sps.bit_depth_luma as i32 - 8)
+                    } else {
+                        // Clause 8.6.1: qPi -> QpCb/QpCr. `QpBdOffsetC` is 0
+                        // for the 8-bit-chroma streams this decoder has been
+                        // validated against; included anyway since it's a
+                        // one-line generalization for higher bit depths.
+                        let offset = if cidx == 1 { self.pps.cb_qp_offset + self.slice_cb_qp_offset } else { self.pps.cr_qp_offset + self.slice_cr_qp_offset };
+                        let qp_bd_offset_c = 6 * (self.sps.bit_depth_chroma as i32 - 8);
+                        let qp_i = (self.qp_y_prev + offset).clamp(-qp_bd_offset_c, 57);
+                        let qp_c = if self.sps.chroma_format_idc == 1 { chroma_qp_mapping(qp_i) } else { qp_i.min(51) };
+                        qp_c + qp_bd_offset_c
+                    };
+                    let dequantized = block(&mut scratch.dequantized, nt)?;
+                    for (i, (o, &c)) in dequantized.iter_mut().zip(coeffs.iter()).enumerate() {
+                        let weight = match self.scaling_list {
+                            Some(list) => list.weight(log2_size, cidx, i % nt, i / nt)?,
+                            None => 16,
+                        };
+                        *o = dequant_with_scale(c, qp, bit_depth, log2_size, weight)?;
+                    }
+                    if transform_skip {
+                        transform_skip_residual(dequantized, nt, bit_depth, res)?;
+                    } else {
+                        let use_dst = self.current_intra && cidx == 0 && nt == 4;
+                        inverse_transform(dequantized, nt, bit_depth, use_dst, &mut scratch.transform_tmp, res)?;
+                    }
                 }
                 for i in 0..nt * nt {
                     let p = *pred.get(i).ok_or(HeifError::MalformedHevc("reconstruct: pred index"))?;
@@ -1191,7 +1216,7 @@ pub(crate) fn decode_slice_rows(pic: &mut Picture, slice_data: &[u8], substream_
 
         let mut bits = BitReader::new(substream);
         let mut engine = Engine::new(&mut bits)?;
-        let mut decoder = Decoder { reference, inter, current_intra: true, inter_partition_split: false, engine: &mut engine, ctxs, sps: sps.clone(), pps: pps.clone(), scaling_list: scaling_list.as_ref(), qp_y_prev, is_cu_qp_delta_coded, slice_cb_qp_offset, slice_cr_qp_offset, scratch: BlockScratch::new() };
+        let mut decoder = Decoder { reference, inter, current_intra: true, transquant_bypass: false, inter_partition_split: false, engine: &mut engine, ctxs, sps: sps.clone(), pps: pps.clone(), scaling_list: scaling_list.as_ref(), qp_y_prev, is_cu_qp_delta_coded, slice_cb_qp_offset, slice_cr_qp_offset, scratch: BlockScratch::new() };
 
         let row_start = first_row + substream_idx * rows_per_substream;
         let row_end = (row_start + rows_per_substream).min(end_row);

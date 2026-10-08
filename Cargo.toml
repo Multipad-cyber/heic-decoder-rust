@@ -1,6 +1,7 @@
 [package]
 name = "heic-decoder-rust"
 description = "Pure-Rust HEIF/HEIC decoder, bit-exact against the HEVC reference decoder. Handles iPhone grid photos, orientation, ICC/EXIF/XMP. No unsafe, no C dependencies."
+repository = "https://github.com/Multipad-cyber/heic-decoder-rust"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"

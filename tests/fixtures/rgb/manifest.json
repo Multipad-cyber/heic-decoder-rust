@@ -1,0 +1,34 @@
+[
+  {
+    "name": "vui2020",
+    "width": 58,
+    "height": 54,
+    "color": [
+      9,
+      16,
+      9,
+      true
+    ],
+    "chroma_location": 1,
+    "sha256": {
+      "8": "3850f24cc5fdb4336d346dffd9238a4015740bfe387d2f3fe840ccb818c1d891",
+      "16": "faa8dcf33996e9b1c8a9c6c5a090645ded2be9790e88f503e66ed21acef453da"
+    }
+  },
+  {
+    "name": "nclx601",
+    "width": 58,
+    "height": 54,
+    "color": [
+      1,
+      13,
+      6,
+      false
+    ],
+    "chroma_location": 1,
+    "sha256": {
+      "8": "2467f5ad0a3a0a43c738857431ffdfbd84b5c5aa16b46a19feaa7faae1cde562",
+      "16": "6686315057ebc065fda7ed81eb8a4656df17211bb7d43e6fbb84814fe530f80f"
+    }
+  }
+]

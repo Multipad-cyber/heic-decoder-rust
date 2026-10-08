@@ -19,6 +19,7 @@ fn init_array<const N: usize>(values: [u8; N], qp: i32) -> [ContextModel; N] {
 
 #[derive(Clone)]
 pub struct Contexts {
+    pub transquant_bypass: [ContextModel; 1],
     pub skip: [ContextModel; 3],
     pub pred_mode: [ContextModel; 1],
     pub merge: [ContextModel; 1],
@@ -80,6 +81,7 @@ impl Contexts {
         Contexts {
             skip: init_array([154; 3], qp), pred_mode: init_array([154], qp),
             merge: init_array([154], qp), merge_idx: init_array([154], qp),
+            transquant_bypass: init_array([154], qp),
             mvp: init_array([154], qp), mvd: init_array([154; 2], qp), root_cbf: init_array([154], qp),
             split_cu_flag: init_array([139, 141, 157], qp),
             part_mode: init_array([184, 154, 139, 154], qp),

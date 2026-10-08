@@ -81,6 +81,12 @@ pub struct Sps {
     pub chroma_format_idc: u32,
     pub pic_width_in_luma_samples: u32,
     pub pic_height_in_luma_samples: u32,
+    /// Output crop in luma samples, ordered left, right, top, bottom.
+    /// Reconstruction and prediction still use the full coded dimensions.
+    pub conformance_window: [u32; 4],
+    pub color_info: Option<crate::color::ColorInfo>,
+    /// Progressive-frame chroma location from SPS VUI (H.273 types 0..=5).
+    pub chroma_location: Option<u32>,
     pub bit_depth_luma: u32,
     pub bit_depth_chroma: u32,
     pub log2_min_luma_coding_block_size: u32,
@@ -138,8 +144,8 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     skip_profile_tier_level(&mut r)?;
     r.ue()?; // sps_seq_parameter_set_id
     let chroma_format_idc = r.ue()?;
-    if chroma_format_idc == 3 {
-        r.bit()?; // separate_colour_plane_flag
+    if chroma_format_idc == 3 && r.flag()? {
+        return Err(HeifError::Unsupported("SPS: separate colour planes not supported"));
     }
     let pic_width_in_luma_samples = r.ue()?;
     let pic_height_in_luma_samples = r.ue()?;
@@ -149,13 +155,20 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     if u64::from(pic_width_in_luma_samples) * u64::from(pic_height_in_luma_samples) > crate::MAX_IMAGE_PIXELS {
         return Err(HeifError::LimitExceeded("SPS: picture larger than MAX_IMAGE_PIXELS"));
     }
+    let mut conformance_window = [0; 4];
     if r.flag()? {
-        // conformance_window_flag: four ue(v) offsets we don't need for
-        // decode (they only crop the output).
-        r.ue()?;
-        r.ue()?;
-        r.ue()?;
-        r.ue()?;
+        // H.265 7.4.3.2.1: offsets are in chroma sampling units, even
+        // though they specify the output window of every colour plane.
+        let sub_w = if matches!(chroma_format_idc, 1 | 2) { 2 } else { 1 };
+        let sub_h = if chroma_format_idc == 1 { 2 } else { 1 };
+        for (offset, unit) in conformance_window.iter_mut().zip([sub_w, sub_w, sub_h, sub_h]) {
+            *offset = r.ue()?.checked_mul(unit).ok_or(HeifError::MalformedHevc("SPS: conformance window overflow"))?;
+        }
+        let [left, right, top, bottom] = conformance_window;
+        if left.checked_add(right).is_none_or(|crop| crop >= pic_width_in_luma_samples)
+            || top.checked_add(bottom).is_none_or(|crop| crop >= pic_height_in_luma_samples) {
+            return Err(HeifError::MalformedHevc("SPS: conformance window exceeds picture"));
+        }
     }
     // Clause 7.4.3.2.1: bit_depth_*_minus8 is in 0..=8.
     let bit_depth_luma = r.ue()?.checked_add(8).filter(|v| *v <= 16).ok_or(HeifError::MalformedHevc("SPS: luma bit depth"))?;
@@ -215,12 +228,29 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     }
     let temporal_mvp_enabled = r.flag()?;
     let strong_intra_smoothing_enabled = r.flag()?;
+    let (color_info, chroma_location) = if r.more_rbsp_data() && r.flag()? {
+        parse_vui(&mut r)?
+    } else { (None, None) };
+    // Range-extension coding tools change residual decoding and prediction.
+    // Reject them instead of silently producing wrong samples.
+    if r.more_rbsp_data() && r.flag()? {
+        let range_extension = r.flag()?;
+        r.bits(7)?; // multilayer, 3D, SCC and 4-bit extension flags
+        // high_precision_offsets_enabled_flag (0b100) only affects weighted
+        // prediction, which slice parsing rejects.
+        if range_extension && r.bits(9)? & !0b100 != 0 {
+            return Err(HeifError::Unsupported("SPS: range extension coding tools not supported"));
+        }
+    }
 
     Ok(Sps {
         log2_max_pic_order_cnt_lsb, short_term_refs, temporal_mvp_enabled,
         chroma_format_idc,
         pic_width_in_luma_samples,
         pic_height_in_luma_samples,
+        conformance_window,
+        color_info,
+        chroma_location,
         bit_depth_luma,
         bit_depth_chroma,
         log2_min_luma_coding_block_size,
@@ -236,6 +266,70 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         pcm_enabled,
         strong_intra_smoothing_enabled,
     })
+}
+
+// Parse the VUI prefix through chroma location. Remaining display/timing
+// and HRD syntax is irrelevant to decoding a progressive still image.
+fn parse_vui(r: &mut BitReader<'_>) -> Result<(Option<crate::color::ColorInfo>, Option<u32>)> {
+    if r.flag()? && r.bits(8)? == 255 { r.bits(16)?; r.bits(16)?; }
+    if r.flag()? { r.bit()?; } // overscan
+    let color = if r.flag()? {
+        r.bits(3)?; // video_format
+        let full_range = r.flag()?;
+        let (color_primaries, transfer_characteristics, matrix_coefficients) = if r.flag()? {
+            (r.bits(8)? as u16, r.bits(8)? as u16, r.bits(8)? as u16)
+        } else { (2, 2, 2) };
+        Some(crate::color::ColorInfo { color_primaries, transfer_characteristics, matrix_coefficients, full_range })
+    } else { None };
+    let location = if r.flag()? {
+        let top = r.ue()?;
+        let bottom = r.ue()?;
+        if top > 5 || bottom > 5 { return Err(HeifError::MalformedHevc("VUI: chroma location out of range")); }
+        Some(top)
+    } else { None };
+    r.bits(3)?; // neutral_chroma_indication, field_seq, frame_field_info_present
+    if r.flag()? {
+        for _ in 0..4 { r.ue()?; } // default display window
+    }
+    if r.flag()? {
+        r.bits(32)?; // vui_num_units_in_tick
+        r.bits(32)?; // vui_time_scale
+        if r.flag()? { r.ue()?; } // vui_num_ticks_poc_diff_one_minus1
+        if r.flag()? { skip_hrd_parameters(r)?; }
+    }
+    if r.flag()? {
+        r.bits(3)?; // tiles_fixed_structure, motion_vectors_over_pic_boundaries, restricted_ref_pic_lists
+        for _ in 0..5 { r.ue()?; }
+    }
+    Ok((color, location))
+}
+
+/// H.265 E.2.2 with commonInfPresentFlag = 1 and a single sub-layer.
+fn skip_hrd_parameters(r: &mut BitReader<'_>) -> Result<()> {
+    let nal_hrd = r.flag()?;
+    let vcl_hrd = r.flag()?;
+    let mut sub_pic_hrd = false;
+    if nal_hrd || vcl_hrd {
+        sub_pic_hrd = r.flag()?;
+        if sub_pic_hrd { r.bits(19)?; } // tick divisor, DU delay lengths, SEI flag
+        r.bits(8)?; // bit_rate_scale, cpb_size_scale
+        if sub_pic_hrd { r.bits(4)?; } // cpb_size_du_scale
+        r.bits(15)?; // initial/AU CPB removal and DPB output delay lengths
+    }
+    let fixed_pic_rate_within_cvs = r.flag()? || r.flag()?;
+    let low_delay = if fixed_pic_rate_within_cvs { r.ue()?; false } else { r.flag()? };
+    let cpb_count = if low_delay { 1 } else {
+        r.ue()?.checked_add(1).filter(|n| *n <= 32).ok_or(HeifError::MalformedHevc("HRD: cpb_cnt_minus1"))?
+    };
+    for _ in 0..u32::from(nal_hrd) + u32::from(vcl_hrd) {
+        for _ in 0..cpb_count {
+            r.ue()?; // bit_rate_value_minus1
+            r.ue()?; // cpb_size_value_minus1
+            if sub_pic_hrd { r.ue()?; r.ue()?; }
+            r.bit()?; // cbr_flag
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone)]
@@ -415,11 +509,11 @@ mod tests {
     }
 
     /// The SPS fields the validation tests vary; `Default` is the minimal SPS.
-    struct SpsFields { width: u32, height: u32, bit_depth_minus8: u32, min_cb_minus3: u32, diff_cb: u32, min_tb_minus2: u32, diff_tb: u32, depth_intra: u32 }
+    struct SpsFields { width: u32, height: u32, chroma: u32, crop: Option<[u32; 4]>, bit_depth_minus8: u32, min_cb_minus3: u32, diff_cb: u32, min_tb_minus2: u32, diff_tb: u32, depth_intra: u32, tail: Vec<u8> }
 
     impl Default for SpsFields {
         fn default() -> Self {
-            SpsFields { width: 15, height: 15, bit_depth_minus8: 0, min_cb_minus3: 0, diff_cb: 1, min_tb_minus2: 0, diff_tb: 1, depth_intra: 0 }
+            SpsFields { width: 15, height: 15, chroma: 1, crop: None, bit_depth_minus8: 0, min_cb_minus3: 0, diff_cb: 1, min_tb_minus2: 0, diff_tb: 1, depth_intra: 0, tail: Vec::new() }
         }
     }
 
@@ -435,10 +529,14 @@ mod tests {
         // profile_tier_level, general part: 2+1+5+32+4+43+1+8 = 96 bits
         push_bits(&mut bits, 0, 96);
         push_ue(&mut bits, 0); // sps_seq_parameter_set_id
-        push_ue(&mut bits, 1); // chroma_format_idc = 4:2:0
+        push_ue(&mut bits, f.chroma);
+        if f.chroma == 3 { push_bits(&mut bits, 0, 1); } // separate_colour_plane_flag
         push_ue(&mut bits, f.width); // pic_width_in_luma_samples (literal ue(v), not minus-anything)
         push_ue(&mut bits, f.height); // pic_height_in_luma_samples
-        push_bits(&mut bits, 0, 1); // conformance_window_flag = 0
+        push_bits(&mut bits, u32::from(f.crop.is_some()), 1);
+        if let Some(crop) = f.crop {
+            for offset in crop { push_ue(&mut bits, offset); }
+        }
         push_ue(&mut bits, f.bit_depth_minus8); // bit_depth_luma_minus8
         push_ue(&mut bits, 0); // bit_depth_chroma_minus8 = 0
         push_ue(&mut bits, 0); // log2_max_pic_order_cnt_lsb_minus4
@@ -460,6 +558,10 @@ mod tests {
         push_bits(&mut bits, 0, 1); // long_term_ref_pics_present_flag = 0
         push_bits(&mut bits, 0, 1); // sps_temporal_mvp_enabled_flag = 0
         push_bits(&mut bits, 1, 1); // strong_intra_smoothing_enabled_flag = 1 (exercised by the assertion below)
+        if !f.tail.is_empty() {
+            bits.extend_from_slice(&f.tail); // VUI flag onwards
+            bits.push(1); // rbsp_stop_one_bit
+        }
         // pad to byte boundary with zero bits (fine: parser stops reading before this matters)
         while !bits.len().is_multiple_of(8) {
             bits.push(0);
@@ -482,12 +584,85 @@ mod tests {
         assert_eq!(sps.chroma_format_idc, 1);
         assert_eq!(sps.pic_width_in_luma_samples, 15);
         assert_eq!(sps.pic_height_in_luma_samples, 15);
+        assert_eq!(sps.conformance_window, [0; 4]);
         assert_eq!(sps.bit_depth_luma, 8);
         assert_eq!(sps.bit_depth_chroma, 8);
         assert_eq!(sps.ctb_log2_size_y(), 4);
         assert!(!sps.pcm_enabled);
         assert!(!sps.scaling_list_enabled);
         assert!(sps.strong_intra_smoothing_enabled);
+    }
+
+    #[test]
+    fn full_vui_is_skipped_and_range_extension_tools_are_rejected() {
+        let vui = |range_extension: Option<u32>| {
+            let mut b = Vec::new();
+            push_bits(&mut b, 1, 1); // vui_parameters_present_flag
+            push_bits(&mut b, 0b001, 3); // no aspect ratio/overscan; video signal type present
+            push_bits(&mut b, 0b00001, 5); // video_format 0, limited range, colour description present
+            push_bits(&mut b, 0x01_01_01, 24); // BT.709 primaries, transfer and matrix
+            push_bits(&mut b, 0b0000, 4); // no chroma location; neutral/field/frame-field flags
+            push_bits(&mut b, 1, 1); // default display window
+            for v in [1, 2, 3, 4] { push_ue(&mut b, v); }
+            push_bits(&mut b, 1, 1); // timing info
+            push_bits(&mut b, 1001, 32);
+            push_bits(&mut b, 60000, 32);
+            push_bits(&mut b, 1, 1); // poc proportional to timing
+            push_ue(&mut b, 0);
+            push_bits(&mut b, 1, 1); // HRD parameters
+            push_bits(&mut b, 0b10, 2); // NAL HRD only
+            push_bits(&mut b, 0, 1); // no sub-picture parameters
+            push_bits(&mut b, 0, 8 + 15);
+            push_bits(&mut b, 1, 1); // fixed_pic_rate_general_flag
+            push_ue(&mut b, 0); // elemental_duration_in_tc_minus1; low_delay_hrd_flag is absent
+            push_ue(&mut b, 1); // two CPB specifications
+            for _ in 0..2 { push_ue(&mut b, 5); push_ue(&mut b, 7); push_bits(&mut b, 1, 1); }
+            push_bits(&mut b, 1, 1); // bitstream restriction
+            push_bits(&mut b, 0, 3);
+            for v in [0, 2, 1, 15, 15] { push_ue(&mut b, v); }
+            match range_extension {
+                None => push_bits(&mut b, 0, 1),
+                Some(flags) => { push_bits(&mut b, 1, 1); push_bits(&mut b, 0b1000_0000, 8); push_bits(&mut b, flags, 9); }
+            }
+            b
+        };
+        for (flags, supported) in [(None, true), (Some(0), true), (Some(0b000_000_100), true),
+                                   (Some(0b000_001_000), false), (Some(0b100_000_000), false), (Some(0b000_000_001), false)] {
+            let sps = parse_sps(&sps_bits(false, &SpsFields { tail: vui(flags), ..Default::default() }));
+            match sps {
+                Ok(sps) => {
+                    assert!(supported, "{flags:?} must be rejected");
+                    assert_eq!(sps.color_info.map(|c| c.matrix_coefficients), Some(1));
+                }
+                Err(e) => assert!(!supported && matches!(e, HeifError::Unsupported(_)), "{flags:?}: {e}"),
+            }
+        }
+        let separate_planes = SpsFields { chroma: 3, ..Default::default() };
+        let mut bits = sps_bits(false, &separate_planes);
+        // 104 header bits, sps_seq_parameter_set_id ue(0) "1", chroma_format_idc ue(3) "00100"
+        // put separate_colour_plane_flag at bit 110.
+        bits[110 / 8] |= 0x80 >> (110 % 8);
+        assert!(matches!(parse_sps(&bits), Err(HeifError::Unsupported(_))));
+    }
+
+    #[test]
+    fn conformance_offsets_use_each_formats_sampling_units() {
+        for (chroma, expected) in [(0, [1, 2, 3, 4]), (1, [2, 4, 6, 8]), (2, [2, 4, 3, 4]), (3, [1, 2, 3, 4])] {
+            let fields = SpsFields { width: 32, height: 32, chroma, crop: Some([1, 2, 3, 4]), ..Default::default() };
+            let sps = parse_sps(&sps_bits(false, &fields)).unwrap();
+            assert_eq!(sps.conformance_window, expected, "chroma={chroma}");
+            assert_eq!((sps.pic_width_in_luma_samples, sps.pic_height_in_luma_samples), (32, 32));
+        }
+    }
+
+    #[test]
+    fn rejects_empty_outside_and_overflowing_conformance_windows() {
+        for crop in [[4, 4, 0, 0], [0, 0, 4, 4], [9, 0, 0, 0], [0, 0, u32::MAX - 1, 0], [u32::MAX - 1, 0, 0, 0]] {
+            let fields = SpsFields { width: 16, height: 16, crop: Some(crop), ..Default::default() };
+            assert!(matches!(parse_sps(&sps_bits(false, &fields)), Err(HeifError::MalformedHevc(_))), "crop={crop:?}");
+        }
+        let fields = SpsFields { chroma: 3, crop: Some([u32::MAX - 1, 2, 0, 0]), ..Default::default() };
+        assert!(matches!(parse_sps(&sps_bits(false, &fields)), Err(HeifError::MalformedHevc(_))));
     }
 
     /// Header values outside the spec's ranges used to reach unchecked

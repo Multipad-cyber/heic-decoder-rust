@@ -175,16 +175,19 @@ pub(super) fn parse(file: &[u8], moov: &[u8]) -> Result<ParsedHeif> {
     let extension = entry.get(78..).ok_or(HeifError::MalformedBox("sequence: short visual sample entry"))?;
     let hevc_config = parse_hvcc(one(extension, b"hvcC")?)?;
     let mut transforms = Vec::new();
+    let mut metadata = Metadata::default();
     for_each_child(extension, 0, extension.len(), 0, |kind, body| {
         if kind == b"clap" { transforms.push(Transform::CleanAperture(parse_clean_aperture(body)?)); }
+        if kind == b"colr" && metadata.color_info.is_none() { metadata.color_info = parse_nclx(body)?; }
         Ok(())
     })?;
     let start = usize::try_from(offset).map_err(|_| HeifError::MalformedBox("sequence: offset overflow"))?;
     let end = start.checked_add(length as usize).ok_or(HeifError::MalformedBox("sequence: extent overflow"))?;
     let data = file.get(start..end).ok_or(HeifError::MalformedBox("sequence: sample outside file"))?.to_vec();
     Ok(ParsedHeif {
+        alpha: None,
         reference_image: None,
-        primary_item_id: track_id, grid: None, transforms, metadata: Default::default(),
+        primary_item_id: track_id, grid: None, transforms, metadata,
         images: vec![ResolvedImage { hevc_config, data }],
         sequence: Some(SequenceFrameInfo { track_id, sample_number, sample_count: sizes.count }),
     })

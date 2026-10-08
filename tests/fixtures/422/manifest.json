@@ -1,0 +1,116 @@
+[
+  {
+    "name": "pattern8",
+    "width": 64,
+    "height": 64,
+    "depth": 8,
+    "qp": 27,
+    "extra": [],
+    "samples": 8192,
+    "fnv": "77e549612970dc84",
+    "sha256": "9c4217b9b1ce62892fff60618996eb4ce423f792c5b15f3422c3138e26e6cea9"
+  },
+  {
+    "name": "pattern10",
+    "width": 96,
+    "height": 80,
+    "depth": 10,
+    "qp": 18,
+    "extra": [
+      "--WaveFrontSynchro=1",
+      "--MaxCuDQPDepth=1",
+      "--MaxDeltaQP=2",
+      "--ScalingList=1"
+    ],
+    "samples": 15360,
+    "fnv": "a99b07a692b1bbe2",
+    "sha256": "3a62b7cbfae073fc25e136201b128579cdac9fed88b6fbf7765bfa60b7542f09"
+  },
+  {
+    "name": "smooth10",
+    "width": 128,
+    "height": 128,
+    "depth": 10,
+    "qp": 44,
+    "extra": [
+      "--CbQpOffset=12",
+      "--CrQpOffset=-12"
+    ],
+    "samples": 32768,
+    "fnv": "8fdac98cc8c1c947",
+    "sha256": "385ab9945c9491df12ace8106e2226af7bffc9153b92cdaaa65873754a16c4c2"
+  },
+  {
+    "name": "flat10",
+    "width": 64,
+    "height": 64,
+    "depth": 10,
+    "qp": 32,
+    "extra": [
+      "--QuadtreeTUMaxDepthIntra=1"
+    ],
+    "samples": 8192,
+    "fnv": "9664b27478157325",
+    "sha256": "d7c3055e4fc8209fdd23e74d7dba0ef76f6bbe379133ebbf679116063d80db28"
+  },
+  {
+    "name": "skip10",
+    "width": 64,
+    "height": 64,
+    "depth": 10,
+    "qp": 0,
+    "extra": [
+      "--LoopFilterDisable=1",
+      "--SAO=0"
+    ],
+    "samples": 8192,
+    "fnv": "3977b95084ec1e37",
+    "sha256": "5577518a6f59756eeb79d5650d050abbad960e541cda0d9a008c322cbaf57e38"
+  },
+  {
+    "name": "pattern12",
+    "width": 64,
+    "height": 64,
+    "depth": 12,
+    "qp": 24,
+    "extra": [],
+    "samples": 8192,
+    "fnv": "77dc7f4e9bf5bf5a",
+    "sha256": "bc63dbb0d1a84d8c8fe8b98e3998b6e01a2febe93476c3d3f0cebc7a88333528"
+  },
+  {
+    "name": "scaled12",
+    "width": 64,
+    "height": 64,
+    "depth": 12,
+    "qp": 24,
+    "extra": [
+      "--SaoLumaOffsetBitShift=2",
+      "--SaoChromaOffsetBitShift=1"
+    ],
+    "samples": 8192,
+    "fnv": "87d3f64ae3ee4aaa",
+    "sha256": "9c85fc2c11e8c35217124f67d87b9473c6033ec8a55085ba955d10b8bec9ade0"
+  },
+  {
+    "name": "slices10",
+    "width": 96,
+    "height": 96,
+    "depth": 10,
+    "qp": 18,
+    "extra": [
+      "--MaxCUWidth=32",
+      "--MaxCUHeight=32",
+      "--MaxPartitionDepth=3",
+      "--SliceMode=1",
+      "--SliceArgument=3",
+      "--LoopFilterDisable=1",
+      "--SAO=0",
+      "--MaxCuDQPDepth=1",
+      "--MaxDeltaQP=2"
+    ],
+    "samples": 18432,
+    "fnv": "c3120db030308147",
+    "sha256": "fd74d7531ccca8d6d43fe9d3d6aa38ae834c9a08accce4f166b07c8a09058a0e"
+  }
+]
