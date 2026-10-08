@@ -1,0 +1,31 @@
+[package]
+name = "heic-decoder-rust"
+description = "Pure-Rust HEIF/HEIC decoder, bit-exact against the HEVC reference decoder. Handles iPhone grid photos, orientation, ICC/EXIF/XMP. No unsafe, no C dependencies."
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+keywords = ["heif", "heic", "image", "decoder", "hevc"]
+categories = ["multimedia::images", "multimedia::video"]
+
+[lib]
+name = "heic_decoder_rust"
+path = "src/lib.rs"
+
+[dependencies]
+thiserror = "2"
+rayon = "1.7"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "decode"
+harness = false
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
