@@ -302,11 +302,31 @@ fn blit_tile(canvas: &mut DecodedImage, tile: &DecodedImage, tile_idx: usize, co
 /// sequence track. This does not implement playback, timing or edit lists;
 /// inspect `isobmff::ParsedHeif::sequence` for the selected sample's identity.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
+    decode_with(bytes, &DecodeOptions::default())
+}
+
+/// Settings for [`decode_with`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DecodeOptions {
+    /// Apply the container's clean aperture, rotation and mirroring
+    /// (`clap`/`irot`/`imir`). With `false`, colour and alpha come back as
+    /// coded: grid-assembled and cropped to the SPS conformance window only.
+    pub apply_transforms: bool,
+}
+
+impl Default for DecodeOptions {
+    fn default() -> Self {
+        DecodeOptions { apply_transforms: true }
+    }
+}
+
+/// [`decode`] with explicit settings.
+pub fn decode_with(bytes: &[u8], options: &DecodeOptions) -> Result<DecodedImage> {
     let mut parsed = isobmff::parse(bytes)?;
     let metadata = std::mem::take(&mut parsed.metadata);
-    let mut image = decode_pixels(&parsed)?;
+    let mut image = decode_pixels(&parsed, options.apply_transforms)?;
     if let Some(auxiliary) = &parsed.alpha {
-        let alpha = decode_pixels(&auxiliary.image)?;
+        let alpha = decode_pixels(&auxiliary.image, options.apply_transforms)?;
         if alpha.width != image.width || alpha.height != image.height {
             return Err(HeifError::Unsupported("alpha: display dimensions do not match colour image"));
         }
@@ -318,13 +338,81 @@ pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     Ok(image)
 }
 
+/// What a file declares, read from the container and parameter sets
+/// without decoding any pixels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ImageInfo {
+    /// Size after the container's crop, rotation and mirroring.
+    pub width: usize,
+    pub height: usize,
+    /// Size before those transforms (after grid assembly and SPS cropping).
+    pub coded_width: usize,
+    pub coded_height: usize,
+    pub bit_depth_luma: u32,
+    pub bit_depth_chroma: u32,
+    pub chroma_format_idc: u32,
+    /// Bit depth of the auxiliary alpha image, if the file has one.
+    pub alpha_bit_depth: Option<u32>,
+}
+
+/// Reads the primary image's size, bit depth and alpha presence without
+/// decoding pixels, so callers can apply their own limits first.
+pub fn probe(bytes: &[u8]) -> Result<ImageInfo> {
+    let parsed = isobmff::parse(bytes)?;
+    let (coded_width, coded_height, sps) = coded_size(&parsed)?;
+    let (width, height) = transformed_size(coded_width, coded_height, &parsed.transforms)?;
+    let alpha_bit_depth = match &parsed.alpha {
+        Some(auxiliary) => Some(coded_size(&auxiliary.image)?.2.bit_depth_luma),
+        None => None,
+    };
+    Ok(ImageInfo {
+        width, height, coded_width, coded_height,
+        bit_depth_luma: sps.bit_depth_luma,
+        bit_depth_chroma: sps.bit_depth_chroma,
+        chroma_format_idc: sps.chroma_format_idc,
+        alpha_bit_depth,
+    })
+}
+
+/// Output size before container transforms, and the first image's SPS.
+fn coded_size(parsed: &isobmff::ParsedHeif) -> Result<(usize, usize, Sps)> {
+    let image = parsed.images.first().ok_or(HeifError::MalformedBox("no image to decode"))?;
+    let sps = find_and_parse(image.hevc_config.nalus_of_type(NAL_SPS), NAL_SPS, parse_sps)?;
+    if let Some(grid) = parsed.grid {
+        return Ok((grid.output_width as usize, grid.output_height as usize, sps));
+    }
+    let [left, right, top, bottom] = sps.conformance_window.map(|v| v as usize);
+    let width = (sps.pic_width_in_luma_samples as usize).checked_sub(left + right).filter(|&v| v != 0);
+    let height = (sps.pic_height_in_luma_samples as usize).checked_sub(top + bottom).filter(|&v| v != 0);
+    match (width, height) {
+        (Some(width), Some(height)) => Ok((width, height, sps)),
+        _ => Err(HeifError::MalformedHevc("SPS: conformance window exceeds picture")),
+    }
+}
+
+/// The size [`apply_transforms`] produces, without touching pixels.
+fn transformed_size(mut width: usize, mut height: usize, transforms: &[isobmff::Transform]) -> Result<(usize, usize)> {
+    for &transform in transforms {
+        match transform {
+            isobmff::Transform::CleanAperture(aperture) => {
+                width = crop_axis(width, aperture.width, aperture.horizontal_offset)?.1;
+                height = crop_axis(height, aperture.height, aperture.vertical_offset)?.1;
+            }
+            isobmff::Transform::Rotate90Ccw(turns) if turns % 2 == 1 => std::mem::swap(&mut width, &mut height),
+            _ => {}
+        }
+    }
+    Ok((width, height))
+}
+
 /// Reads the primary image's ICC profile, nclx colour description, EXIF
 /// and XMP without decoding any pixels.
 pub fn read_metadata(bytes: &[u8]) -> Result<isobmff::Metadata> {
     Ok(isobmff::parse(bytes)?.metadata)
 }
 
-fn decode_pixels(parsed: &isobmff::ParsedHeif) -> Result<DecodedImage> {
+fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<DecodedImage> {
+    let transforms = if transform { parsed.transforms.as_slice() } else { &[] };
     let reference = parsed.reference_image.as_ref().map(|image| {
         let nalus = split_length_prefixed_nalus(&image.data, image.hevc_config.length_size_minus_one as usize + 1)?;
         for nal in nalus {
@@ -339,7 +427,7 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif) -> Result<DecodedImage> {
     let Some(grid) = parsed.grid else {
         let image = parsed.images.first().ok_or(HeifError::MalformedBox("no image to decode"))?;
         let (sps, pic) = decode_with_reference(image, reference.as_ref().map(|(_, pic)| pic))?;
-        return apply_transforms(image_from_picture(&sps, pic)?, &parsed.transforms);
+        return apply_transforms(image_from_picture(&sps, pic)?, transforms);
     };
 
     if parsed.images.len() != (grid.rows as usize) * (grid.columns as usize) {
@@ -399,7 +487,7 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif) -> Result<DecodedImage> {
     for (idx, tile) in tiles.iter().enumerate() {
         blit_tile(&mut canvas, tile, idx, grid.columns, tile_width, tile_height)?;
     }
-    apply_transforms(canvas, &parsed.transforms)
+    apply_transforms(canvas, transforms)
 }
 
 /// A single plane's `width x height` raster, read via `(x, y)` for

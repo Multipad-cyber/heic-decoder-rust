@@ -20,6 +20,11 @@ let rgb = image.to_rgb16()?; // rgb.data holds u16 RGB triples, 0..=65535
 // Preserve transparency when needed:
 let rgba = image.to_rgba16()?; // rgba.data holds u16 RGBA quadruples
 
+// Size, depth and alpha without decoding pixels, e.g. to enforce limits:
+let info = heic_decoder_rust::probe(&data)?;
+// Pixels as coded, without the container's crop/rotation/mirror:
+let coded = heic_decoder_rust::decode_with(&data, &heic_decoder_rust::DecodeOptions { apply_transforms: false })?;
+
 // ICC profile, EXIF and XMP as raw bytes; also available without
 // decoding via heic_decoder_rust::read_metadata(&data)
 let icc = image.metadata.icc_profile; // e.g. Display P3 on iPhone photos
