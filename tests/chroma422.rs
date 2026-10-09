@@ -1,5 +1,5 @@
 //! Independently encoded/decoded HM fixtures; see fixtures/422/README.md.
-use heic_decoder_rust::{decode, decode_one_image, isobmff::{parse, split_length_prefixed_nalus}};
+use heic_decoder::{decode, decode_one_image, isobmff::{parse, split_length_prefixed_nalus}};
 
 #[test]
 fn chroma_422_matches_hm_including_loop_filters() {

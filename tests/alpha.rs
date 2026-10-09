@@ -1,5 +1,5 @@
 //! Original HM oracles; see fixtures/alpha/README.md for provenance.
-use heic_decoder_rust::{decode, isobmff::parse};
+use heic_decoder::{decode, isobmff::parse};
 
 fn hash(samples: impl Iterator<Item = i32>) -> u64 {
     samples.fold(0xcbf29ce484222325, |hash, sample| (hash ^ sample as u64).wrapping_mul(0x100000001b3))

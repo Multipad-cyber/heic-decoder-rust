@@ -1,7 +1,7 @@
 //! HM-reference checks for SPS output crops, including cropped grid tiles.
-use heic_decoder_rust::{decode, decode_one_image, isobmff::parse};
+use heic_decoder::{decode, decode_one_image, isobmff::parse};
 
-fn sample_hash(image: &heic_decoder_rust::DecodedImage) -> u64 {
+fn sample_hash(image: &heic_decoder::DecodedImage) -> u64 {
     image.y.iter().chain(&image.cb).chain(&image.cr).fold(0xcbf29ce484222325, |hash, &sample| {
         (hash ^ sample as u64).wrapping_mul(0x100000001b3)
     })

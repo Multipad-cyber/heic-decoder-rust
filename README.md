@@ -1,4 +1,4 @@
-# heic-decoder-rust
+# heic-decoder
 
 A pure-Rust HEIF/HEIC still-image decoder. Opens the photos your iPhone takes — no C libraries, no `unsafe`, no system codecs.
 
@@ -8,9 +8,14 @@ A pure-Rust HEIF/HEIC still-image decoder. Opens the photos your iPhone takes �
 - **Grid tiles decoded in parallel** across all CPU cores
 - **MIT OR Apache-2.0**
 
+```toml
+[dependencies]
+heic-decoder = "0.1"
+```
+
 ```rust
 let data = std::fs::read("photo.heic")?;
-let image = heic_decoder_rust::decode(&data)?;
+let image = heic_decoder::decode(&data)?;
 println!("{}×{}, {}-bit", image.width, image.height, image.bit_depth_luma);
 // image.y / image.cb / image.cr hold the planar samples
 
@@ -21,12 +26,12 @@ let rgb = image.to_rgb16()?; // rgb.data holds u16 RGB triples, 0..=65535
 let rgba = image.to_rgba16()?; // rgba.data holds u16 RGBA quadruples
 
 // Size, depth and alpha without decoding pixels, e.g. to enforce limits:
-let info = heic_decoder_rust::probe(&data)?;
+let info = heic_decoder::probe(&data)?;
 // Pixels as coded, without the container's crop/rotation/mirror:
-let coded = heic_decoder_rust::decode_with(&data, &heic_decoder_rust::DecodeOptions { apply_transforms: false })?;
+let coded = heic_decoder::decode_with(&data, &heic_decoder::DecodeOptions { apply_transforms: false })?;
 
 // ICC profile, EXIF and XMP as raw bytes; also available without
-// decoding via heic_decoder_rust::read_metadata(&data)
+// decoding via heic_decoder::read_metadata(&data)
 let icc = image.metadata.icc_profile; // e.g. Display P3 on iPhone photos
 let exif = image.metadata.exif;       // TIFF-format, ready for an EXIF parser
 ```
@@ -96,7 +101,7 @@ tile matches HM.
 
 ## Comparison with other Rust decoders
 
-| | heic-decoder-rust | [heic-rs](https://github.com/tbraun96/heic-rs) 0.1.1 | [imazen/heic](https://github.com/imazen/heic) |
+| | heic-decoder | [heic-rs](https://github.com/tbraun96/heic-rs) 0.1.1 | [imazen/heic](https://github.com/imazen/heic) |
 |---|---|---|---|
 | Nokia conformance files decoded | **62 / 63** | 44 / 63 | 61 / 63 |
 | Raw YCbCr output on 788 coded images¹ | **bit-exact** | **bit-exact** | ±1–2 errors in 114 images |
@@ -104,9 +109,9 @@ tile matches HM.
 | HEIC sample photo, 12 MP grid | 345 ms | **202 ms** | 771 ms |
 | 44 conformance files all three decode | 2.65 s | **1.90 s** | 2.47 s |
 
-¹ Every grid tile and single image from the conformance suite and 15 real photos, each decoded by all three from the identical bitstream and compared sample by sample before colour conversion. heic-decoder-rust and heic-rs agree on all 784 images both decode. On the 114 images where imazen/heic differs (1,055 samples, mostly luma), [HM](https://vcgit.hhi.fraunhofer.de/jvet/HM), the official HEVC reference decoder, matches heic-decoder-rust and heic-rs exactly.
+¹ Every grid tile and single image from the conformance suite and 15 real photos, each decoded by all three from the identical bitstream and compared sample by sample before colour conversion. heic-decoder and heic-rs agree on all 784 images both decode. On the 114 images where imazen/heic differs (1,055 samples, mostly luma), [HM](https://vcgit.hhi.fraunhofer.de/jvet/HM), the official HEVC reference decoder, matches heic-decoder and heic-rs exactly.
 
-Timings: median of repeated runs, release builds, Apple M4 (5 cores). These measurements use the planar `decode` API and exclude optional RGB conversion. heic-rs and imazen/heic were asked for RGB output, so heic-decoder-rust does slightly less work in this comparison.
+Timings: median of repeated runs, release builds, Apple M4 (5 cores). These measurements use the planar `decode` API and exclude optional RGB conversion. heic-rs and imazen/heic were asked for RGB output, so heic-decoder does slightly less work in this comparison.
 
 ## Testing
 
@@ -118,6 +123,8 @@ export HEIF_CONFORMANCE_DIR=/path/to/conformance_files
 cargo test -- --ignored        # bit-exact checks against HM output
 cargo bench                    # decode benchmarks
 ```
+
+The `internals` cargo feature exposes the container parser and per-image HEVC decoding for these comparisons and for `examples/reference_image.rs`. It is unstable and not covered by semver.
 
 The conformance files are available at [nokiatech/heif_conformance](https://github.com/nokiatech/heif_conformance).
 

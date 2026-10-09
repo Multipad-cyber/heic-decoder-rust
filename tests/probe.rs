@@ -1,5 +1,5 @@
 //! `probe` must predict what decoding returns, with and without transforms.
-use heic_decoder_rust::{decode_with, probe, DecodeOptions};
+use heic_decoder::{decode_with, probe, DecodeOptions};
 
 #[test]
 fn probe_matches_decoded_geometry_depth_and_alpha() {

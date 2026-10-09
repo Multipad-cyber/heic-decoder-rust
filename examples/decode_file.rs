@@ -18,7 +18,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match heic_decoder_rust::decode(&bytes) {
+    match heic_decoder::decode(&bytes) {
         Ok(img) => {
             println!("DECODED: {}x{} bit_depth={}/{} chroma_format_idc={}", img.width, img.height, img.bit_depth_luma, img.bit_depth_chroma, img.chroma_format_idc);
             if let Some(out) = env::args().nth(2) {

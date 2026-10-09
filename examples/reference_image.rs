@@ -1,6 +1,6 @@
 //! Inspect a resolved HEIF item and export its coded stream for HM comparison.
 //! Usage: reference_image <file.heic> <item-index> <out.hevc> [out.yuv]
-use heic_decoder_rust::{bitreader::strip_emulation_prevention, hevc::{nal::parse_nal_header, params::{parse_sps, parse_pps}}, isobmff::{parse, split_length_prefixed_nalus}};
+use heic_decoder::{bitreader::strip_emulation_prevention, hevc::{nal::parse_nal_header, params::{parse_sps, parse_pps}}, isobmff::{parse, split_length_prefixed_nalus}};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().collect();
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     std::fs::write(&args[3], annexb)?;
     if let Some(out) = args.get(4) {
-        let (sps, pic) = heic_decoder_rust::decode_one_image(image)?;
+        let (sps, pic) = heic_decoder::decode_one_image(image)?;
         let mut raw = Vec::new();
         for (samples, depth) in [(pic.y.into_samples(), sps.bit_depth_luma), (pic.cb.into_samples(), sps.bit_depth_chroma), (pic.cr.into_samples(), sps.bit_depth_chroma)] {
             for sample in samples {

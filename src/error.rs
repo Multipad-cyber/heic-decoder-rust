@@ -4,8 +4,7 @@ use thiserror::Error;
 ///
 /// No variant here is reachable by a panic: every parser in this crate
 /// returns `Result` instead of indexing, unwrapping or asserting on
-/// attacker-controlled input (see `AGENTS.md` Rule 9 in the parent
-/// workspace). A malformed or truncated file is always `Err`, never a
+/// attacker-controlled input. A malformed or truncated file is always `Err`, never a
 /// crash.
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum HeifError {

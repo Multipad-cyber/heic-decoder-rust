@@ -1,6 +1,6 @@
 //! Independent float64 RGB oracles from HM planar output, with colour
 //! signalled in SPS VUI and with a conflicting container nclx override.
-use heic_decoder_rust::{decode, decode_one_image, isobmff::parse, ColorInfo};
+use heic_decoder::{decode, decode_one_image, isobmff::parse, ColorInfo};
 
 #[test]
 fn rgb8_and_rgb16_match_independent_reference_with_vui_and_nclx() {

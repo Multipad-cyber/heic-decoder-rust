@@ -1,17 +1,24 @@
 [package]
-name = "heic-decoder-rust"
-description = "Pure-Rust HEIF/HEIC decoder, bit-exact against the HEVC reference decoder. Handles iPhone grid photos, orientation, ICC/EXIF/XMP. No unsafe, no C dependencies."
+name = "heic-decoder"
+description = "Pure-Rust HEIF/HEIC decoder, bit-exact against the HEVC reference decoder. Handles iPhone grid photos, camera 4:2:2, alpha, orientation, ICC/EXIF/XMP. No unsafe, no C dependencies."
 repository = "https://github.com/Multipad-cyber/heic-decoder-rust"
+documentation = "https://docs.rs/heic-decoder"
+readme = "README.md"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 rust-version = "1.90"
 keywords = ["heif", "heic", "image", "decoder", "hevc"]
 categories = ["multimedia::images", "multimedia::video"]
+# The library, its documentation and licences. Tests, fixtures, benches and
+# fixture generators stay in the repository.
+include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE", "/Cargo.toml", "/examples/decode_file.rs", "/examples/decode_rgb.rs"]
 
-[lib]
-name = "heic_decoder_rust"
-path = "src/lib.rs"
+[features]
+# Unstable access to the container parser and HEVC decoding stages, used by
+# the HM comparison tests and the reference_image example. Not covered by
+# semver; do not depend on it.
+internals = []
 
 [dependencies]
 thiserror = "2"
@@ -19,10 +26,16 @@ rayon = "1.7"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+# Tests compare individual coded images against HM through the internals.
+heic-decoder = { path = ".", features = ["internals"] }
 
 [[bench]]
 name = "decode"
 harness = false
+
+[[example]]
+name = "reference_image"
+required-features = ["internals"]
 
 [lints.rust]
 unsafe_code = "forbid"

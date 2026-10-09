@@ -12,7 +12,7 @@
 //!
 //! ```no_run
 //! let data = std::fs::read("photo.heic")?;
-//! let image = heic_decoder_rust::decode(&data)?;
+//! let image = heic_decoder::decode(&data)?;
 //! println!("{}x{}, {}-bit", image.width, image.height, image.bit_depth_luma);
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
@@ -22,14 +22,29 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 
+// The parsers and the HEVC decoding stages are not part of the stable API.
+// The `internals` feature exposes them for the HM comparison tests and tools.
+#[cfg(feature = "internals")]
 pub mod bitreader;
-pub mod color;
-pub mod error;
+#[cfg(not(feature = "internals"))]
+#[allow(dead_code)] // parsed fields and helpers used by `internals` users and tests
+mod bitreader;
+#[cfg(feature = "internals")]
 pub mod hevc;
+#[cfg(not(feature = "internals"))]
+#[allow(dead_code)] // parsed fields and helpers used by `internals` users and tests
+mod hevc;
+#[cfg(feature = "internals")]
 pub mod isobmff;
+#[cfg(not(feature = "internals"))]
+#[allow(dead_code)] // parsed fields and helpers used by `internals` users and tests
+mod isobmff;
+mod color;
+mod error;
 
 pub use error::{HeifError, Result};
 pub use color::{ChromaSampling, ChromaUpsampling, ColorInfo, RgbImage, RgbOptions, RgbaImage};
+pub use isobmff::Metadata;
 
 /// Largest picture, in luma samples, that the decoder will allocate
 /// (2^28, about 268 megapixels). Applies to each coded image, to the
@@ -82,7 +97,7 @@ pub struct DecodedImage {
     pub cb_width: usize,
     pub cb_height: usize,
     /// ICC profile, EXIF and XMP attached to the image.
-    pub metadata: isobmff::Metadata,
+    pub metadata: Metadata,
 }
 
 fn find_and_parse<T>(nalus: impl Iterator<Item = impl AsRef<[u8]>>, expected_type: u8, parse: impl Fn(&[u8]) -> Result<T>) -> Result<T> {
@@ -101,7 +116,14 @@ fn find_and_parse<T>(nalus: impl Iterator<Item = impl AsRef<[u8]>>, expected_typ
 /// The picture retains coded padding and the SPS conformance window for
 /// reference prediction and bitstream comparisons. [`decode`] applies the
 /// window to each image before grid assembly and container transforms.
+/// Unstable: only with the `internals` feature.
+#[cfg(feature = "internals")]
 pub fn decode_one_image(image: &ResolvedImage) -> Result<(Sps, Picture)> {
+    decode_with_reference(image, None)
+}
+
+#[cfg(not(feature = "internals"))]
+fn decode_one_image(image: &ResolvedImage) -> Result<(Sps, Picture)> {
     decode_with_reference(image, None)
 }
 
@@ -299,8 +321,7 @@ fn blit_tile(canvas: &mut DecodedImage, tile: &DecodedImage, tile_idx: usize, co
 /// an identity-derived image, or a `grid` of `hvc1` tiles stitched into one picture (what real
 /// full-resolution iPhone photos use) — to planar YCbCr.
 /// With no still-image metadata, selects one sync sample from an image/video
-/// sequence track. This does not implement playback, timing or edit lists;
-/// inspect `isobmff::ParsedHeif::sequence` for the selected sample's identity.
+/// sequence track. This does not implement playback, timing or edit lists.
 pub fn decode(bytes: &[u8]) -> Result<DecodedImage> {
     decode_with(bytes, &DecodeOptions::default())
 }
@@ -407,7 +428,7 @@ fn transformed_size(mut width: usize, mut height: usize, transforms: &[isobmff::
 
 /// Reads the primary image's ICC profile, nclx colour description, EXIF
 /// and XMP without decoding any pixels.
-pub fn read_metadata(bytes: &[u8]) -> Result<isobmff::Metadata> {
+pub fn read_metadata(bytes: &[u8]) -> Result<Metadata> {
     Ok(isobmff::parse(bytes)?.metadata)
 }
 

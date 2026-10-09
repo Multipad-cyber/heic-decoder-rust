@@ -30,7 +30,7 @@ fn container_parse(c: &mut Criterion) {
     for name in FILES {
         if let Some(bytes) = fixture(name) {
             group.bench_function(name, |b| {
-                b.iter(|| heic_decoder_rust::isobmff::parse(black_box(&bytes)))
+                b.iter(|| heic_decoder::isobmff::parse(black_box(&bytes)))
             });
         }
     }
@@ -47,13 +47,13 @@ fn decode_file(c: &mut Criterion) {
     for name in FILES {
         if let Some(bytes) = fixture(name) {
             // Measure throughput in pixels decoded
-            if let Ok(img) = heic_decoder_rust::decode(&bytes) {
+            if let Ok(img) = heic_decoder::decode(&bytes) {
                 group.throughput(Throughput::Elements(
                     (img.width as u64) * (img.height as u64),
                 ));
             }
             group.bench_function(name, |b| {
-                b.iter(|| heic_decoder_rust::decode(black_box(&bytes)))
+                b.iter(|| heic_decoder::decode(black_box(&bytes)))
             });
         }
     }
