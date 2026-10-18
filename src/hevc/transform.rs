@@ -117,118 +117,103 @@ fn log2_usize(n: usize) -> u32 {
     n.trailing_zeros()
 }
 
+/// The `n`-point DCT-II basis: rows `0, 32/n, 2*32/n, ...` of [`MAT_DCT`], first `n` columns.
+const fn dct_matrix<const N: usize>() -> [[i32; N]; N] {
+    let mut m = [[0; N]; N];
+    let mut j = 0;
+    while j < N {
+        let mut i = 0;
+        while i < N {
+            m[j][i] = MAT_DCT[32 / N * j][i];
+            i += 1;
+        }
+        j += 1;
+    }
+    m
+}
+
+const MAT_DCT_4: [[i32; 4]; 4] = dct_matrix();
+const MAT_DCT_8: [[i32; 8]; 8] = dct_matrix();
+const MAT_DCT_16: [[i32; 16]; 16] = dct_matrix();
+const MAT_DCT_32: [[i32; 32]; 32] = dct_matrix();
+
+/// `Clip3(coeffMin, coeffMax, v)` with the 16-bit coefficient range (clause 8.6.4.2).
+fn clip_coeff(v: i32) -> i32 {
+    v.clamp(-32768, 32767)
+}
+
 /// Inverse transform for an `nT x nT` block of dequantized coefficients
 /// (row-major, `coeffs[y*nT+x]`), producing the spatial residual
-/// (row-major `i32`, clipped to the coefficient range the spec allows
-/// mid-pipeline). `use_dst` selects the 4x4 DST-VII (luma intra 4x4
-/// only); every other case uses the DCT-II. `tmp` holds the intermediate
-/// column pass; neither it nor `out` needs clearing beforehand, so the
-/// caller can reuse both across blocks.
-#[allow(clippy::needless_range_loop)] // matrix math: several loop variables index different arrays at once.
-pub fn inverse_transform(coeffs: &[i32], nt: usize, bit_depth: u32, use_dst: bool, tmp: &mut [i64], out: &mut [i32]) -> Result<()> {
-    if coeffs.len() != nt * nt || out.len() != nt * nt || tmp.len() < nt * nt {
+/// (row-major `i32`). `use_dst` selects the 4x4 DST-VII (luma intra 4x4
+/// only); every other case uses the DCT-II. `out` needs no clearing
+/// beforehand, so the caller can reuse it across blocks.
+pub fn inverse_transform(coeffs: &[i32], nt: usize, bit_depth: u32, use_dst: bool, out: &mut [i32]) -> Result<()> {
+    if coeffs.len() != nt * nt || out.len() != nt * nt {
         return Err(HeifError::MalformedHevc("inverse_transform: coefficient buffer size mismatch"));
     }
-    if !(nt == 4 || nt == 8 || nt == 16 || nt == 32) {
-        return Err(HeifError::Unsupported("inverse_transform: size must be 4/8/16/32"));
-    }
-    let max_coeff_bits = 15; // clause 7.4.9.11: CoeffMin/Max use a 15-bit-plus-sign range for the default (non-extended) bit depths this decoder supports.
-    let coeff_min = -(1i64 << max_coeff_bits);
-    let coeff_max = (1i64 << max_coeff_bits) - 1;
-
-    let bd_shift2: i32 = 20 - bit_depth as i32;
-    if bd_shift2 < 1 {
-        return Err(HeifError::Unsupported("inverse_transform: bit depth too high"));
-    }
-
-    if use_dst {
-        if nt != 4 {
-            return Err(HeifError::MalformedHevc("inverse_transform: DST-VII only valid for 4x4"));
-        }
-        let rnd_v: i64 = 1 << 6; // 1<<(7-1)
-        let rnd_h: i64 = 1 << (bd_shift2 - 1);
-        let mut g = [[0i64; 4]; 4];
-        for c in 0..4 {
-            for i in 0..4 {
-                let mut sum: i64 = 0;
-                for j in 0..4 {
-                    sum += MAT_DST_4[j][i] as i64 * coeffs[c + j * 4] as i64;
-                }
-                g[i][c] = ((sum + rnd_v) >> 7).clamp(coeff_min, coeff_max);
-            }
-        }
-        let dst = out;
-        for y in 0..4 {
-            for i in 0..4 {
-                let mut sum: i64 = 0;
-                for j in 0..4 {
-                    sum += MAT_DST_4[j][i] as i64 * g[y][j];
-                }
-                let v = i32::try_from((sum + rnd_h) >> bd_shift2).map_err(|_| HeifError::MalformedHevc("inverse_transform: overflow"))?;
-                *dst.get_mut(y * 4 + i).ok_or(HeifError::MalformedHevc("inverse_transform: index"))? = v;
-            }
-        }
-        return Ok(());
-    }
-
-    let log2_nt = log2_usize(nt);
-    let fact = 1usize << (5 - log2_nt);
-    let rnd1: i64 = 1 << 6;
-    let rnd2: i64 = 1 << (bd_shift2 - 1);
-
-    let mat = |row: usize, col: usize| -> Result<i64> {
-        let r = fact.checked_mul(row).ok_or(HeifError::MalformedHevc("inverse_transform: index"))?;
-        Ok(*MAT_DCT.get(r).and_then(|row| row.get(col)).ok_or(HeifError::MalformedHevc("inverse_transform: matrix index out of range"))? as i64)
+    let bd_shift = match 20u32.checked_sub(bit_depth) {
+        Some(shift) if shift >= 1 => shift,
+        _ => return Err(HeifError::Unsupported("inverse_transform: bit depth too high")),
     };
-
-    let g = tmp;
-    for c in 0..nt {
-        let mut last_col = None;
-        for j in (0..nt).rev() {
-            if *coeffs.get(c + j * nt).ok_or(HeifError::MalformedHevc("inverse_transform: index"))? != 0 {
-                last_col = Some(j);
-                break;
-            }
-        }
-        let Some(last_col) = last_col else {
-            for i in 0..nt {
-                *g.get_mut(c + i * nt).ok_or(HeifError::MalformedHevc("inverse_transform: index"))? = 0;
-            }
-            continue;
-        };
-        for i in 0..nt {
-            let mut sum: i64 = 0;
-            for j in 0..=last_col {
-                sum += mat(j, i)? * *coeffs.get(c + j * nt).ok_or(HeifError::MalformedHevc("inverse_transform: index"))? as i64;
-            }
-            *g.get_mut(c + i * nt).ok_or(HeifError::MalformedHevc("inverse_transform: index"))? = ((sum + rnd1) >> 7).clamp(coeff_min, coeff_max);
-        }
-    }
-
-    let dst = out;
-    for y in 0..nt {
-        let row_start = y * nt;
-        let mut last_col = None;
-        for j in (0..nt).rev() {
-            if *g.get(row_start + j).ok_or(HeifError::MalformedHevc("inverse_transform: index"))? != 0 {
-                last_col = Some(j);
-                break;
-            }
-        }
-        let Some(last_col) = last_col else {
-            dst.get_mut(row_start..row_start + nt).ok_or(HeifError::MalformedHevc("inverse_transform: index"))?.fill(0);
-            continue;
-        };
-        for i in 0..nt {
-            let mut sum: i64 = 0;
-            for j in 0..=last_col {
-                sum += mat(j, i)? * *g.get(row_start + j).ok_or(HeifError::MalformedHevc("inverse_transform: index"))?;
-            }
-            let v = i32::try_from((sum + rnd2) >> bd_shift2).map_err(|_| HeifError::MalformedHevc("inverse_transform: overflow"))?;
-            *dst.get_mut(row_start + i).ok_or(HeifError::MalformedHevc("inverse_transform: index"))? = v;
-        }
+    match (nt, use_dst) {
+        (4, true) => two_stage(coeffs, &MAT_DST_4, bd_shift, out),
+        (_, true) => return Err(HeifError::MalformedHevc("inverse_transform: DST-VII only valid for 4x4")),
+        (4, false) => two_stage(coeffs, &MAT_DCT_4, bd_shift, out),
+        (8, false) => two_stage(coeffs, &MAT_DCT_8, bd_shift, out),
+        (16, false) => two_stage(coeffs, &MAT_DCT_16, bd_shift, out),
+        (32, false) => two_stage(coeffs, &MAT_DCT_32, bd_shift, out),
+        _ => return Err(HeifError::Unsupported("inverse_transform: size must be 4/8/16/32")),
     }
     Ok(())
+}
+
+/// The separable two-stage transform of clause 8.6.4.2 with basis `m`
+/// (`m[j][i]`: basis function `j` at sample `i`). `coeffs` and `out` hold
+/// exactly `N * N` values.
+///
+/// Everything fits `i32`: both stages take inputs clipped to 16 bits (the
+/// input here too, which dequantization already guarantees), and a sum of
+/// 32 products of a 16-bit value with a basis entry of at most 90 stays
+/// below 2^27. The loops run over whole fixed-size rows, so the compiler
+/// can vectorise them; all-zero coefficient rows, most of a typical
+/// block, are skipped.
+fn two_stage<const N: usize>(coeffs: &[i32], m: &[[i32; N]; N], bd_shift: u32, out: &mut [i32]) {
+    // Stage 1 (vertical): g[i][c] = sum_j m[j][i] * d[j][c], accumulated
+    // one coefficient row j at a time so the inner loop runs along c.
+    let mut g = [[0i32; N]; N];
+    for (row, basis) in coeffs.as_chunks::<N>().0.iter().zip(m) {
+        if row.iter().all(|&d| d == 0) {
+            continue;
+        }
+        let d = row.map(clip_coeff);
+        for (g_row, &weight) in g.iter_mut().zip(basis) {
+            for (acc, &dc) in g_row.iter_mut().zip(&d) {
+                *acc += weight * dc;
+            }
+        }
+    }
+    for g_row in &mut g {
+        for v in g_row.iter_mut() {
+            *v = clip_coeff((*v + 64) >> 7);
+        }
+    }
+
+    // Stage 2 (horizontal): out[y][i] = sum_j m[j][i] * g[y][j].
+    let rnd = 1i32 << (bd_shift - 1);
+    for (dst, g_row) in out.as_chunks_mut::<N>().0.iter_mut().zip(&g) {
+        let mut acc = [0i32; N];
+        for (&gj, basis) in g_row.iter().zip(m) {
+            if gj == 0 {
+                continue;
+            }
+            for (a, &weight) in acc.iter_mut().zip(basis) {
+                *a += weight * gj;
+            }
+        }
+        for (o, a) in dst.iter_mut().zip(acc) {
+            *o = (a + rnd) >> bd_shift;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -237,8 +222,8 @@ mod tests {
 
     // Buffers start out full of garbage, as reused decoder scratch would.
     fn idct(coeffs: &[i32], nt: usize, bit_depth: u32, use_dst: bool) -> Result<Vec<i32>> {
-        let (mut tmp, mut out) = (vec![99i64; coeffs.len()], vec![99; coeffs.len()]);
-        inverse_transform(coeffs, nt, bit_depth, use_dst, &mut tmp, &mut out).map(|()| out)
+        let mut out = vec![99; coeffs.len()];
+        inverse_transform(coeffs, nt, bit_depth, use_dst, &mut out).map(|()| out)
     }
 
     fn transform_skip(coeffs: &[i32], nt: usize, bit_depth: u32) -> Result<Vec<i32>> {
@@ -301,6 +286,61 @@ mod tests {
         // fact = 51<<5 = 1632. offset=1<<1=2. level=10: (10*1632+2)>>2 = 16322>>2=4080.
         let v = dequant(10, 32, 8, 3).expect("dequant should succeed");
         assert_eq!(v, 4080);
+    }
+
+    /// The two stages written out directly from clause 8.6.4.2 in `i64`,
+    /// indexing the 32-point basis as the spec does.
+    fn reference(coeffs: &[i32], nt: usize, bit_depth: u32, use_dst: bool) -> Vec<i32> {
+        let m = |j: usize, i: usize| i64::from(if use_dst { MAT_DST_4[j][i] } else { MAT_DCT[32 / nt * j][i] });
+        let mut g = vec![0i64; nt * nt];
+        for c in 0..nt {
+            for i in 0..nt {
+                let sum: i64 = (0..nt).map(|j| m(j, i) * i64::from(coeffs[j * nt + c])).sum();
+                g[i * nt + c] = ((sum + 64) >> 7).clamp(-32768, 32767);
+            }
+        }
+        let shift = 20 - bit_depth;
+        (0..nt * nt).map(|k| {
+            let (y, i) = (k / nt, k % nt);
+            let sum: i64 = (0..nt).map(|j| m(j, i) * g[y * nt + j]).sum();
+            ((sum + (1 << (shift - 1))) >> shift) as i32
+        }).collect()
+    }
+
+    #[test]
+    fn matches_the_spec_formula_on_random_blocks() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for (nt, use_dst) in [(4, true), (4, false), (8, false), (16, false), (32, false)] {
+            for bit_depth in [8, 10, 12] {
+                for _ in 0..200 {
+                    // Mostly zeros, like real blocks, with full-range values in between.
+                    let coeffs: Vec<i32> = (0..nt * nt).map(|_| {
+                        let r = next();
+                        if r % 4 == 0 { (r >> 16) as i32 % 32768 } else { 0 }
+                    }).collect();
+                    assert_eq!(idct(&coeffs, nt, bit_depth, use_dst).unwrap(), reference(&coeffs, nt, bit_depth, use_dst), "nt={nt} dst={use_dst} bd={bit_depth}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn extreme_coefficients_do_not_overflow() {
+        // Valid streams never exceed 16 bits here (dequantization clips);
+        // larger values are clipped on input instead of overflowing `i32`.
+        for nt in [4, 8, 16, 32] {
+            for v in [32767, -32768, i32::MAX, i32::MIN] {
+                let coeffs = vec![v; nt * nt];
+                let clipped = vec![v.clamp(-32768, 32767); nt * nt];
+                assert_eq!(idct(&coeffs, nt, 8, false).unwrap(), reference(&clipped, nt, 8, false));
+            }
+        }
     }
 
     #[test]

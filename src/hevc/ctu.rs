@@ -409,7 +409,6 @@ struct BlockScratch {
     coeffs: [i32; 32 * 32],
     dequantized: [i32; 32 * 32],
     residual: [i32; 32 * 32],
-    transform_tmp: [i64; 32 * 32],
 }
 
 /// The leading `nt x nt` part of a scratch buffer.
@@ -419,7 +418,7 @@ fn block(buf: &mut [i32], nt: usize) -> Result<&mut [i32]> {
 
 impl BlockScratch {
     fn new() -> Box<Self> {
-        Box::new(BlockScratch { pred: [0; 32 * 32], coeffs: [0; 32 * 32], dequantized: [0; 32 * 32], residual: [0; 32 * 32], transform_tmp: [0; 32 * 32] })
+        Box::new(BlockScratch { pred: [0; 32 * 32], coeffs: [0; 32 * 32], dequantized: [0; 32 * 32], residual: [0; 32 * 32] })
     }
 }
 
@@ -1119,7 +1118,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                         transform_skip_residual(dequantized, nt, bit_depth, res)?;
                     } else {
                         let use_dst = self.current_intra && cidx == 0 && nt == 4;
-                        inverse_transform(dequantized, nt, bit_depth, use_dst, &mut scratch.transform_tmp, res)?;
+                        inverse_transform(dequantized, nt, bit_depth, use_dst, res)?;
                     }
                 }
                 for i in 0..nt * nt {
