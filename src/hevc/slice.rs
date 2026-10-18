@@ -46,11 +46,14 @@ pub fn parse_slice_header(rbsp: &[u8], nal_unit_type: u8, sps: &Sps, pps: &Pps) 
         return Err(HeifError::Unsupported("slice header: dependent slice segments not supported"));
     }
     let ctb = 1usize << sps.ctb_log2_size_y();
-    let ctb_count = (sps.pic_width_in_luma_samples as usize).div_ceil(ctb)
-        * (sps.pic_height_in_luma_samples as usize).div_ceil(ctb);
-    let slice_segment_address = if first_slice_segment_in_pic { 0 } else {
+    let ctb_count = (sps.pic_width_in_luma_samples as usize).div_ceil(ctb) * (sps.pic_height_in_luma_samples as usize).div_ceil(ctb);
+    let slice_segment_address = if first_slice_segment_in_pic {
+        0
+    } else {
         let address = r.bits(usize::BITS - (ctb_count - 1).leading_zeros())? as usize;
-        if address == 0 || address >= ctb_count { return Err(HeifError::MalformedHevc("slice: segment address out of range")); }
+        if address == 0 || address >= ctb_count {
+            return Err(HeifError::MalformedHevc("slice: segment address out of range"));
+        }
         address
     };
     for _ in 0..pps.num_extra_slice_header_bits {
@@ -71,36 +74,47 @@ pub fn parse_slice_header(rbsp: &[u8], nal_unit_type: u8, sps: &Sps, pps: &Pps) 
         let use_sps_set = r.flag()?;
         let set = if use_sps_set {
             let count = sps.short_term_refs.len();
-            if count == 0 { return Err(HeifError::MalformedHevc("slice: no SPS reference set")); }
+            if count == 0 {
+                return Err(HeifError::MalformedHevc("slice: no SPS reference set"));
+            }
             let index = if count > 1 { r.bits(usize::BITS - (count - 1).leading_zeros())? as usize } else { 0 };
             sps.short_term_refs.get(index).cloned().ok_or(HeifError::MalformedHevc("slice: RPS index out of range"))?
         } else {
             super::params::parse_short_term_refs(&mut r, sps.short_term_refs.len(), &sps.short_term_refs, true)?
         };
         reference_deltas = set.0.iter().filter_map(|&(delta, used)| used.then_some(delta)).collect();
-        if sps.temporal_mvp_enabled { temporal_mvp = r.flag()?; }
+        if sps.temporal_mvp_enabled {
+            temporal_mvp = r.flag()?;
+        }
     }
 
     let mut sao_luma = false;
     let mut sao_chroma = false;
     if sps.sample_adaptive_offset_enabled {
         sao_luma = r.flag()?;
-        if sps.chroma_format_idc != 0 { sao_chroma = r.flag()?; }
+        if sps.chroma_format_idc != 0 {
+            sao_chroma = r.flag()?;
+        }
     }
 
     let inter = if slice_type == 1 {
-        let references = if r.flag()? { r.ue()?.checked_add(1).ok_or(HeifError::MalformedHevc("slice: reference count overflow"))? } else { pps.default_l0_references };
+        let references =
+            if r.flag()? { r.ue()?.checked_add(1).ok_or(HeifError::MalformedHevc("slice: reference count overflow"))? } else { pps.default_l0_references };
         if references != 1 || reference_deltas.len() != 1 {
             return Err(HeifError::Unsupported("P slice: only one short-term reference supported"));
         }
         // List modification syntax is absent with NumPicTotalCurr == 1.
         let cabac_init_b = pps.cabac_init_present && r.flag()?;
         // With one L0 reference, collocated_ref_idx is inferred as zero.
-        if pps.weighted_pred { return Err(HeifError::Unsupported("P slice: weighted prediction")); }
+        if pps.weighted_pred {
+            return Err(HeifError::Unsupported("P slice: weighted prediction"));
+        }
         let merge_delta = r.ue()?;
         let max_merge_candidates = 5u32.checked_sub(merge_delta).filter(|&n| n != 0).ok_or(HeifError::MalformedHevc("slice: merge candidate count"))?;
         Some(InterSlice { poc_lsb, reference_deltas, max_merge_candidates, cabac_init_b, temporal_mvp })
-    } else { None };
+    } else {
+        None
+    };
 
     // SliceQpY, clause 7.4.7.1: PPS's init_qp (already includes the +26
     // offset per `parse_pps`) plus this slice's delta.
@@ -197,12 +211,15 @@ mod tests {
 
     fn test_sps() -> Sps {
         Sps {
-            log2_max_pic_order_cnt_lsb: 8, short_term_refs: Vec::new(), temporal_mvp_enabled: false,
+            log2_max_pic_order_cnt_lsb: 8,
+            short_term_refs: Vec::new(),
+            temporal_mvp_enabled: false,
             chroma_format_idc: 1,
             pic_width_in_luma_samples: 16,
             pic_height_in_luma_samples: 16,
             conformance_window: [0; 4],
-            color_info: None, chroma_location: None,
+            color_info: None,
+            chroma_location: None,
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             log2_min_luma_coding_block_size: 3,
@@ -223,7 +240,10 @@ mod tests {
     fn test_pps() -> Pps {
         Pps {
             sao_offset_scale: [0; 2],
-            default_l0_references: 1, weighted_pred: false, lists_modification_present: false, log2_parallel_merge_level: 2,
+            default_l0_references: 1,
+            weighted_pred: false,
+            lists_modification_present: false,
+            log2_parallel_merge_level: 2,
             dependent_slice_segments_enabled: false,
             output_flag_present: false,
             num_extra_slice_header_bits: 0,

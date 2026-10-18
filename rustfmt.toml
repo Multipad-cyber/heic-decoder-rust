@@ -1,0 +1,3 @@
+# Same style as PhotoCraft and the other craft apps: wide lines, compact small items.
+max_width = 160
+use_small_heuristics = "Max"

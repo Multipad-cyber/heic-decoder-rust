@@ -20,13 +20,19 @@ fn main() -> ExitCode {
 
     match heic_decoder::decode(&bytes) {
         Ok(img) => {
-            println!("DECODED: {}x{} bit_depth={}/{} chroma_format_idc={}", img.width, img.height, img.bit_depth_luma, img.bit_depth_chroma, img.chroma_format_idc);
+            println!(
+                "DECODED: {}x{} bit_depth={}/{} chroma_format_idc={}",
+                img.width, img.height, img.bit_depth_luma, img.bit_depth_chroma, img.chroma_format_idc
+            );
             if let Some(out) = env::args().nth(2) {
                 let mut raw = Vec::new();
                 for (samples, depth) in [(&img.y, img.bit_depth_luma), (&img.cb, img.bit_depth_chroma), (&img.cr, img.bit_depth_chroma)] {
                     for &v in samples {
-                        if depth > 8 { raw.extend_from_slice(&(v as u16).to_le_bytes()); }
-                        else { raw.push(v as u8); }
+                        if depth > 8 {
+                            raw.extend_from_slice(&(v as u16).to_le_bytes());
+                        } else {
+                            raw.push(v as u8);
+                        }
                     }
                 }
                 fs::write(&out, &raw).expect("write yuv");

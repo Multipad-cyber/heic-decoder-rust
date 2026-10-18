@@ -8,16 +8,12 @@ use crate::error::{HeifError, Result};
 
 // H.265 Tables 7-5 and 7-6, in raster order.
 const DEFAULT_INTRA: [i32; 64] = [
-    16,16,16,16,17,18,21,24, 16,16,16,16,17,19,22,25,
-    16,16,17,18,20,22,25,29, 16,16,18,21,24,27,31,36,
-    17,17,20,24,30,35,41,47, 18,19,22,27,35,44,54,65,
-    21,22,25,31,41,54,70,88, 24,25,29,36,47,65,88,115,
+    16, 16, 16, 16, 17, 18, 21, 24, 16, 16, 16, 16, 17, 19, 22, 25, 16, 16, 17, 18, 20, 22, 25, 29, 16, 16, 18, 21, 24, 27, 31, 36, 17, 17, 20, 24, 30, 35, 41,
+    47, 18, 19, 22, 27, 35, 44, 54, 65, 21, 22, 25, 31, 41, 54, 70, 88, 24, 25, 29, 36, 47, 65, 88, 115,
 ];
 const DEFAULT_INTER: [i32; 64] = [
-    16,16,16,16,17,18,20,24, 16,16,16,17,18,20,24,25,
-    16,16,17,18,20,24,25,28, 16,17,18,20,24,25,28,33,
-    17,18,20,24,25,28,33,41, 18,20,24,25,28,33,41,54,
-    20,24,25,28,33,41,54,71, 24,25,28,33,41,54,71,91,
+    16, 16, 16, 16, 17, 18, 20, 24, 16, 16, 16, 17, 18, 20, 24, 25, 16, 16, 17, 18, 20, 24, 25, 28, 16, 17, 18, 20, 24, 25, 28, 33, 17, 18, 20, 24, 25, 28, 33,
+    41, 18, 20, 24, 25, 28, 33, 41, 54, 20, 24, 25, 28, 33, 41, 54, 71, 24, 25, 28, 33, 41, 54, 71, 91,
 ];
 
 #[derive(Debug, Clone)]
@@ -30,11 +26,17 @@ pub struct ScalingListData {
 
 impl Default for ScalingListData {
     fn default() -> Self {
-        let coeffs = std::array::from_fn(|size| std::array::from_fn(|matrix| {
-            if size == 0 { vec![16; 16] }
-            else if matrix < 3 { DEFAULT_INTRA.to_vec() }
-            else { DEFAULT_INTER.to_vec() }
-        }));
+        let coeffs = std::array::from_fn(|size| {
+            std::array::from_fn(|matrix| {
+                if size == 0 {
+                    vec![16; 16]
+                } else if matrix < 3 {
+                    DEFAULT_INTRA.to_vec()
+                } else {
+                    DEFAULT_INTER.to_vec()
+                }
+            })
+        });
         Self { coeffs, dc: [[16; 6]; 2] }
     }
 }
@@ -57,8 +59,7 @@ impl ScalingListData {
         }
         let side = nt.min(8);
         let step = nt / side;
-        self.coeffs[stored_size][matrix].get((y / step) * side + x / step)
-            .copied().ok_or(HeifError::MalformedHevc("scaling list: incomplete matrix"))
+        self.coeffs[stored_size][matrix].get((y / step) * side + x / step).copied().ok_or(HeifError::MalformedHevc("scaling list: incomplete matrix"))
     }
 }
 
@@ -76,7 +77,9 @@ pub(crate) fn parse_scaling_list_data(r: &mut BitReader<'_>) -> Result<ScalingLi
                 if delta != 0 {
                     let source = matrix - delta * step;
                     lists.coeffs[size][matrix] = lists.coeffs[size][source].clone();
-                    if size >= 2 { lists.dc[size - 2][matrix] = lists.dc[size - 2][source]; }
+                    if size >= 2 {
+                        lists.dc[size - 2][matrix] = lists.dc[size - 2][source];
+                    }
                 }
                 // delta == 0 selects the default matrix already installed.
             } else {
@@ -120,8 +123,7 @@ mod tests {
     }
 
     fn pack(bits: &[u8]) -> Vec<u8> {
-        bits.chunks(8).map(|chunk| chunk.iter().enumerate()
-            .fold(0, |byte, (i, bit)| byte | (bit << (7 - i)))).collect()
+        bits.chunks(8).map(|chunk| chunk.iter().enumerate().fold(0, |byte, (i, bit)| byte | (bit << (7 - i)))).collect()
     }
 
     #[test]
@@ -144,7 +146,9 @@ mod tests {
                 if size == 2 && matrix == 0 {
                     bits.push(1); // explicit 16x16 intra-luma matrix
                     se(&mut bits, 12); // DC = 20
-                    for i in 0..64 { se(&mut bits, if i < 2 { 1 } else { 0 }); }
+                    for i in 0..64 {
+                        se(&mut bits, if i < 2 { 1 } else { 0 });
+                    }
                 } else {
                     bits.push(0);
                     // Copy both the DC and matrix into the next slot.
@@ -169,8 +173,13 @@ mod tests {
     #[test]
     fn explicit_asymmetric_matrix_is_not_left_in_scan_order() {
         let mut bits = vec![1];
-        for _ in 0..16 { se(&mut bits, 1); } // 9,10,11,... in scan order
-        for _ in 1..20 { bits.push(0); ue(&mut bits, 0); }
+        for _ in 0..16 {
+            se(&mut bits, 1);
+        } // 9,10,11,... in scan order
+        for _ in 1..20 {
+            bits.push(0);
+            ue(&mut bits, 0);
+        }
         let bytes = pack(&bits);
         let lists = parse_scaling_list_data(&mut BitReader::new(&bytes)).unwrap();
         assert_eq!(lists.weight(2, 0, 0, 0).unwrap(), 9);
@@ -191,10 +200,15 @@ mod tests {
     #[test]
     fn size_32_predictor_copies_matrix_zero_and_its_dc() {
         let mut bits = Vec::new();
-        for _ in 0..18 { bits.push(0); ue(&mut bits, 0); }
+        for _ in 0..18 {
+            bits.push(0);
+            ue(&mut bits, 0);
+        }
         bits.push(1); // sizeId=3, matrixId=0: explicit
         se(&mut bits, 15); // DC=23
-        for _ in 0..64 { se(&mut bits, 1); }
+        for _ in 0..64 {
+            se(&mut bits, 1);
+        }
         bits.push(0); // sizeId=3, matrixId=3: predicted
         ue(&mut bits, 1); // step of 3 -> copy matrixId 0
         let bytes = pack(&bits);

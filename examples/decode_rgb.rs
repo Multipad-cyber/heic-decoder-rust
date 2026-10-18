@@ -6,7 +6,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let input = args.next().ok_or("usage: decode_rgb <input.heic> <output.ppm> [8|16]")?;
     let output = args.next().ok_or("usage: decode_rgb <input.heic> <output.ppm> [8|16]")?;
     let depth = args.next().unwrap_or_else(|| "8".to_owned());
-    if depth != "8" && depth != "16" { return Err("output depth must be 8 or 16".into()); }
+    if depth != "8" && depth != "16" {
+        return Err("output depth must be 8 or 16".into());
+    }
     let image = heic_decoder::decode(&std::fs::read(input)?)?;
     let mut file = BufWriter::new(std::fs::File::create(output)?);
     writeln!(file, "P6\n{} {}\n{}", image.width, image.height, if depth == "8" { 255 } else { 65535 })?;

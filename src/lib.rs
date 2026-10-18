@@ -29,6 +29,8 @@ pub mod bitreader;
 #[cfg(not(feature = "internals"))]
 #[allow(dead_code)] // parsed fields and helpers used by `internals` users and tests
 mod bitreader;
+mod color;
+mod error;
 #[cfg(feature = "internals")]
 pub mod hevc;
 #[cfg(not(feature = "internals"))]
@@ -39,11 +41,9 @@ pub mod isobmff;
 #[cfg(not(feature = "internals"))]
 #[allow(dead_code)] // parsed fields and helpers used by `internals` users and tests
 mod isobmff;
-mod color;
-mod error;
 
-pub use error::{HeifError, Result};
 pub use color::{ChromaSampling, ChromaUpsampling, ColorInfo, RgbImage, RgbOptions, RgbaImage};
+pub use error::{HeifError, Result};
 pub use isobmff::Metadata;
 
 /// Largest picture, in luma samples, that the decoder will allocate
@@ -53,13 +53,13 @@ pub use isobmff::Metadata;
 pub const MAX_IMAGE_PIXELS: u64 = 1 << 28;
 
 use bitreader::{ebsp_len_to_rbsp_len, rbsp_len_to_ebsp_pos, strip_emulation_prevention};
-use hevc::ctu::{decode_slice_rows, Picture};
+use hevc::ctu::{Picture, decode_slice_rows};
 use hevc::deblock::deblock_picture;
-use hevc::nal::{is_irap_nal, parse_nal_header, NAL_PPS, NAL_SPS};
-use hevc::params::{parse_pps, parse_sps, Pps, Sps};
+use hevc::nal::{NAL_PPS, NAL_SPS, is_irap_nal, parse_nal_header};
+use hevc::params::{Pps, Sps, parse_pps, parse_sps};
 use hevc::sao::apply_sao;
 use hevc::slice::parse_slice_header;
-use isobmff::{split_length_prefixed_nalus, ResolvedImage};
+use isobmff::{ResolvedImage, split_length_prefixed_nalus};
 
 /// Native, full-range opacity: zero is transparent, `(1 << bit_depth) - 1`
 /// is opaque. Samples have the same dimensions and orientation as the image.
@@ -134,8 +134,7 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
     if sps.chroma_format_idc > 3 {
         return Err(HeifError::Unsupported("decode: unsupported chroma format"));
     }
-    if pps.sao_offset_scale[0] > sps.bit_depth_luma.saturating_sub(10)
-        || pps.sao_offset_scale[1] > sps.bit_depth_chroma.saturating_sub(10) {
+    if pps.sao_offset_scale[0] > sps.bit_depth_luma.saturating_sub(10) || pps.sao_offset_scale[1] > sps.bit_depth_chroma.saturating_sub(10) {
         return Err(HeifError::MalformedHevc("decode: SAO offset scale exceeds bit depth"));
     }
     if pps.tiles_enabled && (pps.num_tile_columns != 1 || pps.num_tile_rows != 1) {
@@ -164,7 +163,9 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
         // Multilayer items can interleave enhancement-layer VCL NALs.
         // This decoder resolves the base layer; only its slices form the
         // independent-slice picture being reconstructed here.
-        if !hevc::nal::is_slice_nal(header.nal_unit_type) || header.nuh_layer_id != 0 { continue; }
+        if !hevc::nal::is_slice_nal(header.nal_unit_type) || header.nuh_layer_id != 0 {
+            continue;
+        }
         if !is_irap_nal(header.nal_unit_type) && reference.is_none() {
             return Err(HeifError::Unsupported("decode: non-IRAP slice NAL in a still image"));
         }
@@ -172,16 +173,22 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
         let (slice_header, byte_pos) = parse_slice_header(&rbsp, header.nal_unit_type, &sps, &pps)?;
         slices.push((slice_header, byte_pos, rbsp, payload));
     }
-    if slices.is_empty() { return Err(HeifError::MalformedHevc("decode: no slice NAL found")); }
+    if slices.is_empty() {
+        return Err(HeifError::MalformedHevc("decode: no slice NAL found"));
+    }
     let ctb = 1usize << sps.ctb_log2_size_y();
     let columns = (sps.pic_width_in_luma_samples as usize).div_ceil(ctb);
     let rows = (sps.pic_height_in_luma_samples as usize).div_ceil(ctb);
-    if slices[0].0.slice_segment_address != 0 { return Err(HeifError::MalformedHevc("decode: missing first slice")); }
+    if slices[0].0.slice_segment_address != 0 {
+        return Err(HeifError::MalformedHevc("decode: missing first slice"));
+    }
     for (index, (slice_header, byte_pos, rbsp, payload)) in slices.iter().enumerate() {
         let byte_pos = *byte_pos;
         let address = slice_header.slice_segment_address;
         let next = slices.get(index + 1).map(|s| s.0.slice_segment_address).unwrap_or(columns * rows);
-        if address >= next { return Err(HeifError::MalformedHevc("decode: overlapping or unordered slices")); }
+        if address >= next {
+            return Err(HeifError::MalformedHevc("decode: overlapping or unordered slices"));
+        }
         if !address.is_multiple_of(columns) || !next.is_multiple_of(columns) {
             return Err(HeifError::Unsupported("decode: slices must cover complete CTU rows"));
         }
@@ -193,10 +200,17 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
                 return Err(HeifError::Unsupported("P picture: scaling lists and constrained intra prediction are not supported"));
             }
             let reference = reference.ok_or(HeifError::Unsupported("P picture requires its prediction dependency"))?;
-            if sps.bit_depth_luma != 8 || sps.bit_depth_chroma != 8 || sps.chroma_format_idc != 1
-                || reference.y.width != pic.y.width || reference.y.height != pic.y.height
-                || reference.y.bit_depth != 8 || reference.cb.bit_depth != 8 || reference.cr.bit_depth != 8
-                || reference.cb.width != pic.cb.width || reference.cb.height != pic.cb.height {
+            if sps.bit_depth_luma != 8
+                || sps.bit_depth_chroma != 8
+                || sps.chroma_format_idc != 1
+                || reference.y.width != pic.y.width
+                || reference.y.height != pic.y.height
+                || reference.y.bit_depth != 8
+                || reference.cb.bit_depth != 8
+                || reference.cr.bit_depth != 8
+                || reference.cb.width != pic.cb.width
+                || reference.cb.height != pic.cb.height
+            {
                 return Err(HeifError::Unsupported("P picture: requires matching 8-bit 4:2:0 IDR reference"));
             }
             if inter.poc_lsb == 0 || inter.reference_deltas != vec![-(inter.poc_lsb as i32)] || inter.cabac_init_b {
@@ -215,7 +229,8 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
             for &delta in &slice_header.entry_point_offsets {
                 cumulative_ebsp = cumulative_ebsp.saturating_add(delta as usize);
                 let rbsp_pos_in_full = ebsp_len_to_rbsp_len(payload, cumulative_ebsp);
-                let rbsp_pos_in_slice_data = rbsp_pos_in_full.checked_sub(byte_pos).ok_or(HeifError::MalformedHevc("decode: entry point before slice data start"))?;
+                let rbsp_pos_in_slice_data =
+                    rbsp_pos_in_full.checked_sub(byte_pos).ok_or(HeifError::MalformedHevc("decode: entry point before slice data start"))?;
                 substream_starts.push(rbsp_pos_in_slice_data);
             }
         }
@@ -231,12 +246,21 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
             slice_header.sao_chroma,
             slice_header.cb_qp_offset,
             slice_header.cr_qp_offset,
-            slice_header.inter.as_ref(), reference,
-            address / columns, next / columns,
+            slice_header.inter.as_ref(),
+            reference,
+            address / columns,
+            next / columns,
         )?;
 
         if !slice_header.deblocking_filter_disabled {
-            deblock_picture(&mut pic, &sps, slice_header.beta_offset_div2, slice_header.tc_offset_div2, pps.cb_qp_offset + slice_header.cb_qp_offset, pps.cr_qp_offset + slice_header.cr_qp_offset)?;
+            deblock_picture(
+                &mut pic,
+                &sps,
+                slice_header.beta_offset_div2,
+                slice_header.tc_offset_div2,
+                pps.cb_qp_offset + slice_header.cb_qp_offset,
+                pps.cr_qp_offset + slice_header.cr_qp_offset,
+            )?;
         }
         if slice_header.sao_luma || slice_header.sao_chroma {
             apply_sao(&mut pic, &sps, slice_header.sao_luma, slice_header.sao_chroma)?;
@@ -264,11 +288,21 @@ fn image_from_picture(sps: &Sps, pic: Picture) -> Result<DecodedImage> {
         cb_height,
         metadata: isobmff::Metadata::default(),
     };
-    if sps.conformance_window == [0; 4] { return Ok(image); }
+    if sps.conformance_window == [0; 4] {
+        return Ok(image);
+    }
     let [left, right, top, bottom] = sps.conformance_window.map(|v| v as usize);
-    let width = image.width.checked_sub(left).and_then(|v| v.checked_sub(right)).filter(|&v| v != 0)
+    let width = image
+        .width
+        .checked_sub(left)
+        .and_then(|v| v.checked_sub(right))
+        .filter(|&v| v != 0)
         .ok_or(HeifError::MalformedHevc("SPS: conformance window exceeds picture"))?;
-    let height = image.height.checked_sub(top).and_then(|v| v.checked_sub(bottom)).filter(|&v| v != 0)
+    let height = image
+        .height
+        .checked_sub(top)
+        .and_then(|v| v.checked_sub(bottom))
+        .filter(|&v| v != 0)
         .ok_or(HeifError::MalformedHevc("SPS: conformance window exceeds picture"))?;
     let (sub_w, sub_h) = chroma_subsampling(image.chroma_format_idc);
     extract_window(image, ImageWindow { left, top, width, height }, sub_w, sub_h)
@@ -351,8 +385,7 @@ pub fn decode_with(bytes: &[u8], options: &DecodeOptions) -> Result<DecodedImage
         if alpha.width != image.width || alpha.height != image.height {
             return Err(HeifError::Unsupported("alpha: display dimensions do not match colour image"));
         }
-        image.alpha = Some(AlphaPlane { bit_depth: alpha.bit_depth_luma, samples: alpha.y,
-            premultiplied: auxiliary.premultiplied });
+        image.alpha = Some(AlphaPlane { bit_depth: alpha.bit_depth_luma, samples: alpha.y, premultiplied: auxiliary.premultiplied });
     }
     image.color_info = metadata.color_info.or(image.color_info);
     image.metadata = metadata;
@@ -387,7 +420,10 @@ pub fn probe(bytes: &[u8]) -> Result<ImageInfo> {
         None => None,
     };
     Ok(ImageInfo {
-        width, height, coded_width, coded_height,
+        width,
+        height,
+        coded_width,
+        coded_height,
         bit_depth_luma: sps.bit_depth_luma,
         bit_depth_chroma: sps.bit_depth_chroma,
         chroma_format_idc: sps.chroma_format_idc,
@@ -434,16 +470,20 @@ pub fn read_metadata(bytes: &[u8]) -> Result<Metadata> {
 
 fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<DecodedImage> {
     let transforms = if transform { parsed.transforms.as_slice() } else { &[] };
-    let reference = parsed.reference_image.as_ref().map(|image| {
-        let nalus = split_length_prefixed_nalus(&image.data, image.hevc_config.length_size_minus_one as usize + 1)?;
-        for nal in nalus {
-            let (header, _) = parse_nal_header(&nal)?;
-            if header.nuh_layer_id == 0 && hevc::nal::is_slice_nal(header.nal_unit_type) && !matches!(header.nal_unit_type, 19 | 20) {
-                return Err(HeifError::Unsupported("prediction dependency must be an IDR picture"));
+    let reference = parsed
+        .reference_image
+        .as_ref()
+        .map(|image| {
+            let nalus = split_length_prefixed_nalus(&image.data, image.hevc_config.length_size_minus_one as usize + 1)?;
+            for nal in nalus {
+                let (header, _) = parse_nal_header(&nal)?;
+                if header.nuh_layer_id == 0 && hevc::nal::is_slice_nal(header.nal_unit_type) && !matches!(header.nal_unit_type, 19 | 20) {
+                    return Err(HeifError::Unsupported("prediction dependency must be an IDR picture"));
+                }
             }
-        }
-        decode_one_image(image)
-    }).transpose()?;
+            decode_one_image(image)
+        })
+        .transpose()?;
 
     let Some(grid) = parsed.grid else {
         let image = parsed.images.first().ok_or(HeifError::MalformedBox("no image to decode"))?;
@@ -468,7 +508,8 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<Decode
 
     // Decode grid tiles in parallel using rayon
     use rayon::prelude::*;
-    let tiles: Vec<DecodedImage> = parsed.images
+    let tiles: Vec<DecodedImage> = parsed
+        .images
         .par_iter()
         .map(|image| {
             let (sps, pic) = decode_one_image(image)?;
@@ -617,7 +658,11 @@ struct ImageWindow {
 }
 
 fn chroma_subsampling(format: u32) -> (usize, usize) {
-    match format { 1 => (2, 2), 2 => (2, 1), _ => (1, 1) }
+    match format {
+        1 => (2, 2),
+        2 => (2, 1),
+        _ => (1, 1),
+    }
 }
 
 fn extract_window(img: DecodedImage, window: ImageWindow, sub_w: usize, sub_h: usize) -> Result<DecodedImage> {
@@ -643,7 +688,8 @@ fn apply_one_transform(img: DecodedImage, t: isobmff::Transform) -> Result<Decod
             for _ in 0..(count % 4) {
                 let sampling = img.chroma_sampling;
                 let chroma_sampling = ChromaSampling {
-                    sub_x: sampling.sub_y, sub_y: sampling.sub_x,
+                    sub_x: sampling.sub_y,
+                    sub_y: sampling.sub_x,
                     origin_x: sampling.origin_y,
                     origin_y: (img.width - 1) as f32 - sampling.origin_x - img.cb_width.saturating_sub(1) as f32 * sampling.sub_x as f32,
                 };
@@ -656,7 +702,8 @@ fn apply_one_transform(img: DecodedImage, t: isobmff::Transform) -> Result<Decod
         }
         isobmff::Transform::MirrorVertical => {
             let mut chroma_sampling = img.chroma_sampling;
-            chroma_sampling.origin_y = (img.height - 1) as f32 - chroma_sampling.origin_y - img.cb_height.saturating_sub(1) as f32 * chroma_sampling.sub_y as f32;
+            chroma_sampling.origin_y =
+                (img.height - 1) as f32 - chroma_sampling.origin_y - img.cb_height.saturating_sub(1) as f32 * chroma_sampling.sub_y as f32;
             let y = mirror_vertical_plane(&img.y, img.width, img.height);
             let cb = mirror_vertical_plane(&img.cb, img.cb_width, img.cb_height);
             let cr = mirror_vertical_plane(&img.cr, img.cb_width, img.cb_height);
@@ -671,7 +718,9 @@ fn apply_one_transform(img: DecodedImage, t: isobmff::Transform) -> Result<Decod
             DecodedImage { y, cb, cr, chroma_sampling, ..img }
         }
     };
-    if result.chroma_format_idc == 0 { result.chroma_sampling = ChromaSampling::coded(0, None); }
+    if result.chroma_format_idc == 0 {
+        result.chroma_sampling = ChromaSampling::coded(0, None);
+    }
     Ok(result)
 }
 
@@ -687,12 +736,7 @@ fn apply_transforms(mut img: DecodedImage, transforms: &[isobmff::Transform]) ->
             }
             isobmff::Transform::Rotate90Ccw(turns) => {
                 for _ in 0..turns % 4 {
-                    window = ImageWindow {
-                        left: window.top,
-                        top: img.width - window.left - window.width,
-                        width: window.height,
-                        height: window.width,
-                    };
+                    window = ImageWindow { left: window.top, top: img.width - window.left - window.width, width: window.height, height: window.width };
                     img = apply_one_transform(img, isobmff::Transform::Rotate90Ccw(1))?;
                     std::mem::swap(&mut sub_w, &mut sub_h);
                 }
@@ -721,33 +765,55 @@ mod tests {
     fn rotated_422_crop_retains_vertical_chroma_subsampling() {
         let img = DecodedImage {
             alpha: None,
-            width: 8, height: 6, cb_width: 4, cb_height: 6, metadata: Default::default(),
-            bit_depth_luma: 10, bit_depth_chroma: 10, chroma_format_idc: 2,
-            color_info: None, chroma_sampling: ChromaSampling::coded(2, None),
-            y: (0..48).collect(), cb: (0..24).collect(), cr: (100..124).collect(),
+            width: 8,
+            height: 6,
+            cb_width: 4,
+            cb_height: 6,
+            metadata: Default::default(),
+            bit_depth_luma: 10,
+            bit_depth_chroma: 10,
+            chroma_format_idc: 2,
+            color_info: None,
+            chroma_sampling: ChromaSampling::coded(2, None),
+            y: (0..48).collect(),
+            cb: (0..24).collect(),
+            cr: (100..124).collect(),
         };
-        let crop = isobmff::Transform::CleanAperture(isobmff::CleanAperture {
-            width: (4, 1), height: (4, 1), horizontal_offset: (0, 1), vertical_offset: (0, 1),
-        });
+        let crop =
+            isobmff::Transform::CleanAperture(isobmff::CleanAperture { width: (4, 1), height: (4, 1), horizontal_offset: (0, 1), vertical_offset: (0, 1) });
         let img = apply_transforms(img, &[isobmff::Transform::Rotate90Ccw(1), crop]).unwrap();
         assert_eq!((img.width, img.height, img.cb_width, img.cb_height), (4, 4, 4, 2));
-        assert_eq!(img.y, [13,21,29,37,12,20,28,36,11,19,27,35,10,18,26,34]);
-        assert_eq!(img.cb, [6,10,14,18,5,9,13,17]);
-        assert_eq!(img.cr, [106,110,114,118,105,109,113,117]);
+        assert_eq!(img.y, [13, 21, 29, 37, 12, 20, 28, 36, 11, 19, 27, 35, 10, 18, 26, 34]);
+        assert_eq!(img.cb, [6, 10, 14, 18, 5, 9, 13, 17]);
+        assert_eq!(img.cr, [106, 110, 114, 118, 105, 109, 113, 117]);
     }
 
     #[test]
     fn nested_odd_crops_keep_the_original_chroma_grid() {
         let image = || DecodedImage {
             alpha: None,
-            width: 12, height: 12, cb_width: 6, cb_height: 6, metadata: Default::default(),
-            bit_depth_luma: 8, bit_depth_chroma: 8, chroma_format_idc: 1,
-            color_info: None, chroma_sampling: ChromaSampling::coded(1, None),
-            y: (0..144).collect(), cb: (0..36).collect(), cr: (100..136).collect(),
+            width: 12,
+            height: 12,
+            cb_width: 6,
+            cb_height: 6,
+            metadata: Default::default(),
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            chroma_format_idc: 1,
+            color_info: None,
+            chroma_sampling: ChromaSampling::coded(1, None),
+            y: (0..144).collect(),
+            cb: (0..36).collect(),
+            cr: (100..136).collect(),
         };
-        let crop = |size| isobmff::Transform::CleanAperture(isobmff::CleanAperture {
-            width: (size, 1), height: (size, 1), horizontal_offset: (0, 1), vertical_offset: (0, 1),
-        });
+        let crop = |size| {
+            isobmff::Transform::CleanAperture(isobmff::CleanAperture {
+                width: (size, 1),
+                height: (size, 1),
+                horizontal_offset: (0, 1),
+                vertical_offset: (0, 1),
+            })
+        };
         // Two offsets of one luma sample add to one chroma sample.
         // Rounding each offset separately would incorrectly keep chroma (0,0).
         let nested = apply_transforms(image(), &[crop(10), crop(8)]).unwrap();
@@ -768,14 +834,23 @@ mod tests {
     fn crop_window_tracks_rotation_and_mirroring() {
         let img = DecodedImage {
             alpha: None,
-            width: 12, height: 8, cb_width: 6, cb_height: 4, metadata: Default::default(),
-            bit_depth_luma: 8, bit_depth_chroma: 8, chroma_format_idc: 1,
-            color_info: None, chroma_sampling: ChromaSampling::coded(1, None),
-            y: (0..96).collect(), cb: (0..24).collect(), cr: (100..124).collect(),
+            width: 12,
+            height: 8,
+            cb_width: 6,
+            cb_height: 4,
+            metadata: Default::default(),
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            chroma_format_idc: 1,
+            color_info: None,
+            chroma_sampling: ChromaSampling::coded(1, None),
+            y: (0..96).collect(),
+            cb: (0..24).collect(),
+            cr: (100..124).collect(),
         };
-        let crop = |w, h| isobmff::Transform::CleanAperture(isobmff::CleanAperture {
-            width: (w, 1), height: (h, 1), horizontal_offset: (0, 1), vertical_offset: (0, 1),
-        });
+        let crop = |w, h| {
+            isobmff::Transform::CleanAperture(isobmff::CleanAperture { width: (w, 1), height: (h, 1), horizontal_offset: (0, 1), vertical_offset: (0, 1) })
+        };
         let img = apply_transforms(img, &[crop(10, 6), isobmff::Transform::Rotate90Ccw(1), crop(4, 8), isobmff::Transform::MirrorHorizontal]).unwrap();
         assert_eq!((img.width, img.height, img.cb_width, img.cb_height), (4, 8, 2, 4));
         for y in 0..8 {
@@ -812,19 +887,26 @@ mod tests {
     fn crop_precedes_rotation_and_preserves_chroma_planes() {
         let img = DecodedImage {
             alpha: None,
-            width: 8, height: 4, cb_width: 4, cb_height: 2, metadata: Default::default(),
-            bit_depth_luma: 8, bit_depth_chroma: 8, chroma_format_idc: 1,
-            color_info: None, chroma_sampling: ChromaSampling::coded(1, None),
-            y: (0..32).collect(), cb: (100..108).collect(), cr: (200..208).collect(),
+            width: 8,
+            height: 4,
+            cb_width: 4,
+            cb_height: 2,
+            metadata: Default::default(),
+            bit_depth_luma: 8,
+            bit_depth_chroma: 8,
+            chroma_format_idc: 1,
+            color_info: None,
+            chroma_sampling: ChromaSampling::coded(1, None),
+            y: (0..32).collect(),
+            cb: (100..108).collect(),
+            cr: (200..208).collect(),
         };
-        let aperture = isobmff::CleanAperture {
-            width: (4, 1), height: (4, 1), horizontal_offset: (0, 1), vertical_offset: (0, 1),
-        };
+        let aperture = isobmff::CleanAperture { width: (4, 1), height: (4, 1), horizontal_offset: (0, 1), vertical_offset: (0, 1) };
         let img = apply_transforms(img, &[isobmff::Transform::CleanAperture(aperture), isobmff::Transform::Rotate90Ccw(1)]).unwrap();
         assert_eq!((img.width, img.height, img.cb_width, img.cb_height), (4, 4, 2, 2));
-        assert_eq!(img.y, vec![5,13,21,29,4,12,20,28,3,11,19,27,2,10,18,26]);
-        assert_eq!(img.cb, vec![102,106,101,105]);
-        assert_eq!(img.cr, vec![202,206,201,205]);
+        assert_eq!(img.y, vec![5, 13, 21, 29, 4, 12, 20, 28, 3, 11, 19, 27, 2, 10, 18, 26]);
+        assert_eq!(img.cb, vec![102, 106, 101, 105]);
+        assert_eq!(img.cr, vec![202, 206, 201, 205]);
     }
 
     /// A 2x2 plane `[[1,2],[3,4]]` (row-major `[1,2,3,4]`) rotated 90°

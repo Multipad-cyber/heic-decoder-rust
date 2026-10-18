@@ -81,8 +81,10 @@ fn filter_luma_segment(pic: &mut Picture, x: usize, y: usize, vertical: bool, be
     if !is_edge {
         return Ok(()); // bS == 0: no CU or transform-block edge here at all.
     }
-    let bs = pic.boundary_strength(qx,qy,vertical);
-    if bs == 0 { return Ok(()); }
+    let bs = pic.boundary_strength(qx, qy, vertical);
+    if bs == 0 {
+        return Ok(());
+    }
 
     let protect_p = pic.bypass_at(px, py);
     let protect_q = pic.bypass_at(qx, qy);
@@ -141,8 +143,12 @@ fn filter_luma_segment(pic: &mut Picture, x: usize, y: usize, vertical: bool, be
             let q0_f = clip3(q0 - tc2, q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(0, max_val);
             let q1_f = clip3(q1 - tc2, q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2).clamp(0, max_val);
             let q2_f = clip3(q2 - tc2, q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(0, max_val);
-            if !protect_p { write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f, p1_f, p2_f]); }
-            if !protect_q { write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f, q1_f, q2_f]); }
+            if !protect_p {
+                write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f, p1_f, p2_f]);
+            }
+            if !protect_q {
+                write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f, q1_f, q2_f]);
+            }
         } else {
             let delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
             if delta.abs() >= 10 * tc {
@@ -163,15 +169,18 @@ fn filter_luma_segment(pic: &mut Picture, x: usize, y: usize, vertical: bool, be
             } else {
                 None
             };
-            if !protect_p { match p1_f {
-                Some(p1_f) => write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f, p1_f]),
-                None => write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f]),
+            if !protect_p {
+                match p1_f {
+                    Some(p1_f) => write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f, p1_f]),
+                    None => write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f]),
+                }
             }
+            if !protect_q {
+                match q1_f {
+                    Some(q1_f) => write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f, q1_f]),
+                    None => write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f]),
+                }
             }
-            if !protect_q { match q1_f {
-                Some(q1_f) => write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f, q1_f]),
-                None => write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f]),
-            } }
         }
     }
     Ok(())
@@ -185,7 +194,7 @@ fn filter_luma_segment(pic: &mut Picture, x: usize, y: usize, vertical: bool, be
 fn chroma_tc(pic: &Picture, lx: i64, ly: i64, vertical: bool, tc_offset: i32, qp_offset: i32, chroma_format_idc: u32, bit_depth: i32) -> Option<i32> {
     let (px, py, qx, qy) = if vertical { (lx - 1, ly, lx, ly) } else { (lx, ly - 1, lx, ly) };
     let is_edge = is_filter_edge(pic, qx, qy, vertical);
-    if !is_edge || pic.boundary_strength(qx,qy,vertical) != 2 {
+    if !is_edge || pic.boundary_strength(qx, qy, vertical) != 2 {
         return None;
     }
     let qp_p = pic.qp_y_at(px, py).unwrap_or(0);
@@ -194,11 +203,7 @@ fn chroma_tc(pic: &Picture, lx: i64, ly: i64, vertical: bool, tc_offset: i32, qp
     let qp_c = if chroma_format_idc == 1 { chroma_qp_mapping(qp_i) } else { qp_i.min(51) };
     let q_tc = clip3(0, 53, qp_c + 2 + tc_offset) as usize; // bS == 2 => 2*(bS-1) == 2.
     let tc = TC_PRIME.get(q_tc).copied()? << (bit_depth - 8);
-    if tc == 0 {
-        None
-    } else {
-        Some(tc)
-    }
+    if tc == 0 { None } else { Some(tc) }
 }
 
 /// Filters one chroma sample pair across an edge (clause 8.7.2.5.5):
@@ -325,7 +330,11 @@ mod tests {
     fn bypass_preserves_either_side_without_disabling_the_other() {
         for protect_p in [false, true] {
             let mut pic = test_picture(8, 4);
-            for y in 0..4 { for x in 0..8 { pic.y.set_sample(x, y, if x < 4 { 100 } else { 110 }); } }
+            for y in 0..4 {
+                for x in 0..8 {
+                    pic.y.set_sample(x, y, if x < 4 { 100 } else { 110 });
+                }
+            }
             pic.set_qp_y(0, 0, 8, 37);
             pic.mark_cu_edges(4, 0, 4);
             pic.mark_bypass(if protect_p { 0 } else { 4 }, 0, 4, true);
@@ -334,7 +343,9 @@ mod tests {
             assert_eq!(pic.y.sample(4, 0), Some(if protect_p { 106 } else { 110 }));
             let mut other = test_picture(8, 2);
             let plane = &mut other.cb;
-            for x in 0..4 { plane.set_sample(x, 0, if x < 2 { 100 } else { 110 }); }
+            for x in 0..4 {
+                plane.set_sample(x, 0, if x < 2 { 100 } else { 110 });
+            }
             filter_chroma_pixels(plane, 2, 0, true, 5, protect_p, !protect_p);
             assert_eq!(plane.sample(1, 0), Some(if protect_p { 100 } else { 104 }));
             assert_eq!(plane.sample(2, 0), Some(if protect_p { 106 } else { 110 }));
@@ -444,12 +455,15 @@ mod tests {
     #[test]
     fn chroma_deblocking_filters_every_row_in_a_segment_not_just_the_first() {
         let sps = Sps {
-            log2_max_pic_order_cnt_lsb: 8, short_term_refs: Vec::new(), temporal_mvp_enabled: false,
+            log2_max_pic_order_cnt_lsb: 8,
+            short_term_refs: Vec::new(),
+            temporal_mvp_enabled: false,
             chroma_format_idc: 1,
             pic_width_in_luma_samples: 24,
             pic_height_in_luma_samples: 8,
             conformance_window: [0; 4],
-            color_info: None, chroma_location: None,
+            color_info: None,
+            chroma_location: None,
             bit_depth_luma: 8,
             bit_depth_chroma: 8,
             log2_min_luma_coding_block_size: 3,

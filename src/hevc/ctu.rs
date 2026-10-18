@@ -10,13 +10,13 @@
 //! crate README.
 
 use super::cabac::Engine;
-use super::inter::{Motion, compensate};
-use super::slice::InterSlice;
 use super::contexts::Contexts;
-use super::intra::{predict_angular, predict_dc, predict_planar, Border};
+use super::inter::{Motion, compensate};
+use super::intra::{Border, predict_angular, predict_dc, predict_planar};
 use super::params::{Pps, Sps};
 use super::residual::decode_residual;
 use super::scaling::ScalingListData;
+use super::slice::InterSlice;
 use super::transform::{chroma_qp_mapping, dequant_with_scale, inverse_transform, transform_skip_residual};
 use crate::bitreader::BitReader;
 use crate::error::{HeifError, Result};
@@ -39,11 +39,7 @@ impl Plane {
             return None;
         }
         let idx = y as usize * self.width + x as usize;
-        if *self.decoded.get(idx)? {
-            self.samples.get(idx).copied()
-        } else {
-            None
-        }
+        if *self.decoded.get(idx)? { self.samples.get(idx).copied() } else { None }
     }
 
     /// Post-reconstruction passes (deblocking, SAO) only ever run after
@@ -156,8 +152,10 @@ impl Picture {
         let min_pu_count = min_pu_width * min_pu_height;
         Picture {
             slice_start_y: 0,
-            motions: vec![None; min_pu_count], skips: vec![false; min_pu_count],
-            luma_residual: vec![false; min_pu_count], bypass: vec![false; min_pu_count],
+            motions: vec![None; min_pu_count],
+            skips: vec![false; min_pu_count],
+            luma_residual: vec![false; min_pu_count],
+            bypass: vec![false; min_pu_count],
             y: Plane::new(width, height, bit_depth_luma),
             cb: Plane::new(cw, ch, bit_depth_chroma),
             cr: Plane::new(cw, ch, bit_depth_chroma),
@@ -185,18 +183,32 @@ impl Picture {
     pub(crate) fn mark_bypass(&mut self, x: usize, y: usize, size: usize, value: bool) {
         for row in (y..(y + size).min(self.y.height)).step_by(4) {
             for col in (x..(x + size).min(self.y.width)).step_by(4) {
-                if let Some(i) = self.min_pu_index(col as i64, row as i64) { self.bypass[i] = value; }
+                if let Some(i) = self.min_pu_index(col as i64, row as i64) {
+                    self.bypass[i] = value;
+                }
             }
         }
     }
-    pub(crate) fn has_bypass(&self) -> bool { self.bypass.iter().any(|&b| b) }
+    pub(crate) fn has_bypass(&self) -> bool {
+        self.bypass.iter().any(|&b| b)
+    }
     /// SAO reads the original raster; restore protected samples after its pass.
     pub(crate) fn restore_bypass(&mut self, cidx: usize, snapshot: &[i32], sub_w: usize, sub_h: usize) {
-        let width = match cidx { 0 => self.y.width, 1 => self.cb.width, _ => self.cr.width };
+        let width = match cidx {
+            0 => self.y.width,
+            1 => self.cb.width,
+            _ => self.cr.width,
+        };
         for (i, &sample) in snapshot.iter().enumerate() {
             if self.bypass_at(((i % width) * sub_w) as i64, ((i / width) * sub_h) as i64) {
-                let plane = match cidx { 0 => &mut self.y, 1 => &mut self.cb, _ => &mut self.cr };
-                if let Some(out) = plane.samples_mut().get_mut(i) { *out = sample; }
+                let plane = match cidx {
+                    0 => &mut self.y,
+                    1 => &mut self.cb,
+                    _ => &mut self.cr,
+                };
+                if let Some(out) = plane.samples_mut().get_mut(i) {
+                    *out = sample;
+                }
             }
         }
     }
@@ -208,29 +220,38 @@ impl Picture {
         self.min_pu_index(x, y).and_then(|i| self.skips.get(i)).copied().unwrap_or(false)
     }
     fn mark_motion(&mut self, x: usize, y: usize, w: usize, h: usize, mv: Motion, skip: bool) {
-        for row in (y..y+h).step_by(4) {
-            for col in (x..x+w).step_by(4) {
+        for row in (y..y + h).step_by(4) {
+            for col in (x..x + w).step_by(4) {
                 if let Some(i) = self.min_pu_index(col as i64, row as i64) {
-                    self.motions[i] = Some(mv); self.skips[i] = skip;
-                    if col == x { self.cu_edge_left[i] = true; }
-                    if row == y { self.cu_edge_top[i] = true; }
+                    self.motions[i] = Some(mv);
+                    self.skips[i] = skip;
+                    if col == x {
+                        self.cu_edge_left[i] = true;
+                    }
+                    if row == y {
+                        self.cu_edge_top[i] = true;
+                    }
                 }
             }
         }
     }
     fn mark_residual(&mut self, x: usize, y: usize, size: usize, coded: bool) {
-        for row in (y..y+size).step_by(4) {
-            for col in (x..x+size).step_by(4) {
-                if let Some(i) = self.min_pu_index(col as i64, row as i64) { self.luma_residual[i] = coded; }
+        for row in (y..y + size).step_by(4) {
+            for col in (x..x + size).step_by(4) {
+                if let Some(i) = self.min_pu_index(col as i64, row as i64) {
+                    self.luma_residual[i] = coded;
+                }
             }
         }
     }
     pub(crate) fn boundary_strength(&self, x: i64, y: i64, vertical: bool) -> i32 {
-        let (px, py) = if vertical { (x-1,y) } else { (x,y-1) };
-        let (Some(a), Some(b)) = (self.motion_at(px,py), self.motion_at(x,y)) else { return 2; };
-        let tu = if vertical { self.is_tu_edge_left(x,y) } else { self.is_tu_edge_top(x,y) }.unwrap_or(false);
-        let coded = |xx,yy| self.min_pu_index(xx,yy).map(|i| self.luma_residual[i]).unwrap_or(false);
-        if tu && (coded(px,py) || coded(x,y)) || (a.x-b.x).abs() >= 4 || (a.y-b.y).abs() >= 4 { 1 } else { 0 }
+        let (px, py) = if vertical { (x - 1, y) } else { (x, y - 1) };
+        let (Some(a), Some(b)) = (self.motion_at(px, py), self.motion_at(x, y)) else {
+            return 2;
+        };
+        let tu = if vertical { self.is_tu_edge_left(x, y) } else { self.is_tu_edge_top(x, y) }.unwrap_or(false);
+        let coded = |xx, yy| self.min_pu_index(xx, yy).map(|i| self.luma_residual[i]).unwrap_or(false);
+        if tu && (coded(px, py) || coded(x, y)) || (a.x - b.x).abs() >= 4 || (a.y - b.y).abs() >= 4 { 1 } else { 0 }
     }
 
     /// Marks `(x0,y0)..(x0+size,y0+size)` as one CU's area: its left
@@ -285,7 +306,9 @@ impl Picture {
     }
 
     pub(crate) fn qp_y_at(&self, x: i64, y: i64) -> Option<i32> {
-        if y < self.slice_start_y as i64 { return None; }
+        if y < self.slice_start_y as i64 {
+            return None;
+        }
         self.min_pu_index(x, y).and_then(|i| self.qp_y.get(i)).map(|&q| q as i32)
     }
 
@@ -437,8 +460,7 @@ fn apply_qp_delta(predicted: i32, delta: i32, bit_depth: u32) -> Result<i32> {
         return Err(HeifError::Unsupported("QP: unsupported bit depth"));
     }
     let offset = 6 * (bit_depth as i32 - 8);
-    Ok(((i64::from(predicted) + i64::from(delta) + i64::from(offset))
-        .rem_euclid(i64::from(52 + offset)) - i64::from(offset)) as i32)
+    Ok(((i64::from(predicted) + i64::from(delta) + i64::from(offset)).rem_euclid(i64::from(52 + offset)) - i64::from(offset)) as i32)
 }
 
 /// MPM candidate-list construction (clause 8.4.2).
@@ -523,7 +545,13 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
             }
             let sao_type_idx = if cidx <= 1 {
                 let model = self.ctxs.sao_type_idx.first_mut().ok_or(HeifError::MalformedHevc("sao_type_idx: context index"))?;
-                let t = if self.engine.decision(model)? == 0 { 0 } else if self.engine.bypass()? == 0 { 1 } else { 2 };
+                let t = if self.engine.decision(model)? == 0 {
+                    0
+                } else if self.engine.bypass()? == 0 {
+                    1
+                } else {
+                    2
+                };
                 if cidx == 1 {
                     sao_type_idx_cb = t;
                 }
@@ -595,18 +623,13 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
         let fits = x0 + size <= self.sps.pic_width_in_luma_samples as usize && y0 + size <= self.sps.pic_height_in_luma_samples as usize;
         let min_cb_log2 = self.sps.log2_min_luma_coding_block_size;
 
-        let split = if fits && log2_cb_size > min_cb_log2 {
-            self.decode_split_cu_flag(pic, x0, y0, ct_depth)?
-        } else {
-            log2_cb_size > min_cb_log2
-        };
+        let split = if fits && log2_cb_size > min_cb_log2 { self.decode_split_cu_flag(pic, x0, y0, ct_depth)? } else { log2_cb_size > min_cb_log2 };
 
         // A QG is either an unsplit CU at least as large as the minimum
         // QG, or the whole subtree rooted at that minimum size. Smaller
         // CUs share the predictor and signal only one delta for the group.
         let min_qg_log2 = self.sps.ctb_log2_size_y() - self.pps.diff_cu_qp_delta_depth;
-        let starts_qg = self.pps.cu_qp_delta_enabled && log2_cb_size >= min_qg_log2
-            && (!split || log2_cb_size == min_qg_log2);
+        let starts_qg = self.pps.cu_qp_delta_enabled && log2_cb_size >= min_qg_log2 && (!split || log2_cb_size == min_qg_log2);
         if starts_qg {
             self.is_cu_qp_delta_coded = false;
             self.qp_y_prev = predict_qp(pic, x0, y0, self.sps.ctb_log2_size_y(), self.qp_y_prev);
@@ -634,14 +657,18 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
     fn motion_delta(&mut self) -> Result<Motion> {
         let mut values = [self.engine.decision(&mut self.ctxs.mvd[0])?, self.engine.decision(&mut self.ctxs.mvd[0])?];
         for value in &mut values {
-            if *value != 0 { *value += self.engine.decision(&mut self.ctxs.mvd[1])?; }
+            if *value != 0 {
+                *value += self.engine.decision(&mut self.ctxs.mvd[1])?;
+            }
         }
         let mut signed = [0; 2];
         for (i, value) in values.iter_mut().enumerate() {
             if *value == 2 {
                 let mut bits = 1u32;
                 while self.engine.bypass()? != 0 {
-                    if bits >= 15 { return Err(HeifError::MalformedHevc("motion delta too large")); }
+                    if bits >= 15 {
+                        return Err(HeifError::MalformedHevc("motion delta too large"));
+                    }
                     *value += 1 << bits;
                     bits += 1;
                 }
@@ -654,34 +681,60 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
 
     #[allow(clippy::too_many_arguments)]
     fn merge_candidates(&self, pic: &Picture, x: usize, y: usize, w: usize, h: usize, exclude_left: bool, exclude_top: bool) -> Vec<Motion> {
-        let (x,y,w,h) = (x as i64,y as i64,w as i64,h as i64);
+        let (x, y, w, h) = (x as i64, y as i64, w as i64, h as i64);
         let level = self.pps.log2_parallel_merge_level;
-        let at = |nx,ny| {
-            if nx >> level == x >> level && ny >> level == y >> level { None } else { pic.motion_at(nx,ny) }
+        let at = |nx, ny| {
+            if nx >> level == x >> level && ny >> level == y >> level { None } else { pic.motion_at(nx, ny) }
         };
-        let a1 = if exclude_left { None } else { at(x-1,y+h-1) };
-        let b1 = if exclude_top { None } else { at(x+w-1,y-1) };
-        let b0 = at(x+w,y-1);
-        let a0 = at(x-1,y+h);
-        let b2 = at(x-1,y-1);
+        let a1 = if exclude_left { None } else { at(x - 1, y + h - 1) };
+        let b1 = if exclude_top { None } else { at(x + w - 1, y - 1) };
+        let b0 = at(x + w, y - 1);
+        let a0 = at(x - 1, y + h);
+        let b2 = at(x - 1, y - 1);
         let mut out = Vec::new();
-        if let Some(v) = a1 { out.push(v); }
-        if let Some(v) = b1 && Some(v) != a1 { out.push(v); }
-        if let Some(v) = b0 && Some(v) != b1 { out.push(v); }
-        if let Some(v) = a0 && Some(v) != a1 { out.push(v); }
-        if out.len() < 4 && let Some(v) = b2 && Some(v) != a1 && Some(v) != b1 { out.push(v); }
+        if let Some(v) = a1 {
+            out.push(v);
+        }
+        if let Some(v) = b1
+            && Some(v) != a1
+        {
+            out.push(v);
+        }
+        if let Some(v) = b0
+            && Some(v) != b1
+        {
+            out.push(v);
+        }
+        if let Some(v) = a0
+            && Some(v) != a1
+        {
+            out.push(v);
+        }
+        if out.len() < 4
+            && let Some(v) = b2
+            && Some(v) != a1
+            && Some(v) != b1
+        {
+            out.push(v);
+        }
         // The sole reference is an IDR picture, so it has no temporal MV.
         out.resize(5, Motion::default());
         out
     }
 
     fn motion_predictors(&self, pic: &Picture, x: usize, y: usize, w: usize, h: usize) -> [Motion; 2] {
-        let (x,y,w,h) = (x as i64,y as i64,w as i64,h as i64);
-        let left = pic.motion_at(x-1,y+h).or_else(|| pic.motion_at(x-1,y+h-1));
-        let above = pic.motion_at(x+w,y-1).or_else(|| pic.motion_at(x+w-1,y-1)).or_else(|| pic.motion_at(x-1,y-1));
+        let (x, y, w, h) = (x as i64, y as i64, w as i64, h as i64);
+        let left = pic.motion_at(x - 1, y + h).or_else(|| pic.motion_at(x - 1, y + h - 1));
+        let above = pic.motion_at(x + w, y - 1).or_else(|| pic.motion_at(x + w - 1, y - 1)).or_else(|| pic.motion_at(x - 1, y - 1));
         let mut list = Vec::new();
-        if let Some(v) = left { list.push(v); }
-        if let Some(v) = above && Some(v) != left { list.push(v); }
+        if let Some(v) = left {
+            list.push(v);
+        }
+        if let Some(v) = above
+            && Some(v) != left
+        {
+            list.push(v);
+        }
         list.resize(2, Motion::default());
         [list[0], list[1]]
     }
@@ -692,29 +745,34 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
         if !skipped {
             let bins = if log2 == self.sps.log2_min_luma_coding_block_size && size != 8 { 3 } else { 2 };
             while shape < bins {
-                if self.engine.decision(&mut self.ctxs.part_mode[shape])? != 0 { break; }
+                if self.engine.decision(&mut self.ctxs.part_mode[shape])? != 0 {
+                    break;
+                }
                 shape += 1;
             }
-            if self.sps.amp_enabled && log2 > self.sps.log2_min_luma_coding_block_size && (shape == 1 || shape == 2)
-                && self.engine.decision(&mut self.ctxs.part_mode[3])? == 0 {
+            if self.sps.amp_enabled
+                && log2 > self.sps.log2_min_luma_coding_block_size
+                && (shape == 1 || shape == 2)
+                && self.engine.decision(&mut self.ctxs.part_mode[3])? == 0
+            {
                 shape = if shape == 1 { 4 } else { 6 } + self.engine.bypass()? as usize;
             }
         }
         let half = size / 2;
         let quarter = size / 4;
         let partitions = match shape {
-            0 => vec![(0,0,size,size)],
-            1 => vec![(0,0,size,half),(0,half,size,half)],
-            2 => vec![(0,0,half,size),(half,0,half,size)],
-            3 => vec![(0,0,half,half),(half,0,half,half),(0,half,half,half),(half,half,half,half)],
-            4 => vec![(0,0,size,quarter),(0,quarter,size,size-quarter)],
-            5 => vec![(0,0,size,size-quarter),(0,size-quarter,size,quarter)],
-            6 => vec![(0,0,quarter,size),(quarter,0,size-quarter,size)],
-            7 => vec![(0,0,size-quarter,size),(size-quarter,0,quarter,size)],
+            0 => vec![(0, 0, size, size)],
+            1 => vec![(0, 0, size, half), (0, half, size, half)],
+            2 => vec![(0, 0, half, size), (half, 0, half, size)],
+            3 => vec![(0, 0, half, half), (half, 0, half, half), (0, half, half, half), (half, half, half, half)],
+            4 => vec![(0, 0, size, quarter), (0, quarter, size, size - quarter)],
+            5 => vec![(0, 0, size, size - quarter), (0, size - quarter, size, quarter)],
+            6 => vec![(0, 0, quarter, size), (quarter, 0, size - quarter, size)],
+            7 => vec![(0, 0, size - quarter, size), (size - quarter, 0, quarter, size)],
             _ => return Err(HeifError::MalformedHevc("inter partition shape")),
         };
         let mut full_merge = false;
-        for (index, &(dx,dy,w,h)) in partitions.iter().enumerate() {
+        for (index, &(dx, dy, w, h)) in partitions.iter().enumerate() {
             let merged = skipped || self.engine.decision(&mut self.ctxs.merge[0])? != 0;
             full_merge = shape == 0 && merged;
             let mv = if merged {
@@ -722,51 +780,56 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 let mut candidate = 0;
                 if max > 1 && self.engine.decision(&mut self.ctxs.merge_idx[0])? != 0 {
                     candidate = 1;
-                    while candidate + 1 < max && self.engine.bypass()? != 0 { candidate += 1; }
+                    while candidate + 1 < max && self.engine.bypass()? != 0 {
+                        candidate += 1;
+                    }
                 }
                 // A merge region can cover all PUs in an 8x8 CU.
                 let shared = self.pps.log2_parallel_merge_level > 2 && size == 8;
-                let (px,py,pw,ph) = if shared { (x,y,size,size) } else { (x+dx,y+dy,w,h) };
-                let left = !shared && index == 1 && matches!(shape, 2|6|7);
-                let top = !shared && index == 1 && matches!(shape, 1|4|5);
-                self.merge_candidates(pic,px,py,pw,ph,left,top)[candidate]
+                let (px, py, pw, ph) = if shared { (x, y, size, size) } else { (x + dx, y + dy, w, h) };
+                let left = !shared && index == 1 && matches!(shape, 2 | 6 | 7);
+                let top = !shared && index == 1 && matches!(shape, 1 | 4 | 5);
+                self.merge_candidates(pic, px, py, pw, ph, left, top)[candidate]
             } else {
                 let delta = self.motion_delta()?;
                 let index = self.engine.decision(&mut self.ctxs.mvp[0])? as usize;
-                self.motion_predictors(pic,x+dx,y+dy,w,h)[index].with_delta(delta)
+                self.motion_predictors(pic, x + dx, y + dy, w, h)[index].with_delta(delta)
             };
             let reference = self.reference.ok_or(HeifError::Unsupported("inter: no reference picture"))?;
-            compensate(&reference.y,&mut pic.y,x+dx,y+dy,w,h,mv,false)?;
-            compensate(&reference.cb,&mut pic.cb,(x+dx)/2,(y+dy)/2,w/2,h/2,mv,true)?;
-            compensate(&reference.cr,&mut pic.cr,(x+dx)/2,(y+dy)/2,w/2,h/2,mv,true)?;
-            pic.mark_motion(x+dx,y+dy,w,h,mv,skipped);
+            compensate(&reference.y, &mut pic.y, x + dx, y + dy, w, h, mv, false)?;
+            compensate(&reference.cb, &mut pic.cb, (x + dx) / 2, (y + dy) / 2, w / 2, h / 2, mv, true)?;
+            compensate(&reference.cr, &mut pic.cr, (x + dx) / 2, (y + dy) / 2, w / 2, h / 2, mv, true)?;
+            pic.mark_motion(x + dx, y + dy, w, h, mv, skipped);
         }
         self.inter_partition_split = shape != 0;
         let residual = !skipped && (full_merge || self.engine.decision(&mut self.ctxs.root_cbf[0])? != 0);
-        if residual { self.transform_tree(pic,x,y,x,y,log2,0,[true;2],[true;2],[0;4],false)?; }
+        if residual {
+            self.transform_tree(pic, x, y, x, y, log2, 0, [true; 2], [true; 2], [0; 4], false)?;
+        }
         // Even a zero-residual CU has an implicit root transform boundary.
         // Its neighbour may have coefficients and require bS = 1.
-        else { pic.mark_tu_edges(x,y,size); }
-        pic.set_qp_y(x,y,size,self.qp_y_prev);
-        pic.mark_cu_edges(x,y,size);
+        else {
+            pic.mark_tu_edges(x, y, size);
+        }
+        pic.set_qp_y(x, y, size, self.qp_y_prev);
+        pic.mark_cu_edges(x, y, size);
         Ok(())
     }
 
     fn coding_unit(&mut self, pic: &mut Picture, x0: usize, y0: usize, log2_cb_size: u32) -> Result<()> {
         let size = 1usize << log2_cb_size;
 
-        self.transquant_bypass = self.pps.transquant_bypass_enabled
-            && self.engine.decision(&mut self.ctxs.transquant_bypass[0])? != 0;
+        self.transquant_bypass = self.pps.transquant_bypass_enabled && self.engine.decision(&mut self.ctxs.transquant_bypass[0])? != 0;
         pic.mark_bypass(x0, y0, size, self.transquant_bypass);
 
         self.current_intra = true;
         self.inter_partition_split = false;
         if self.inter.is_some() {
-            let ctx = pic.skip_at(x0 as i64 - 1,y0 as i64) as usize + pic.skip_at(x0 as i64,y0 as i64 - 1) as usize;
+            let ctx = pic.skip_at(x0 as i64 - 1, y0 as i64) as usize + pic.skip_at(x0 as i64, y0 as i64 - 1) as usize;
             let skipped = self.engine.decision(&mut self.ctxs.skip[ctx])? != 0;
             if skipped || self.engine.decision(&mut self.ctxs.pred_mode[0])? == 0 {
                 self.current_intra = false;
-                return self.inter_unit(pic,x0,y0,log2_cb_size,skipped);
+                return self.inter_unit(pic, x0, y0, log2_cb_size, skipped);
             }
         }
 
@@ -826,7 +889,19 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
         // Delta presence is tracked across all CUs in the quantization
         // group, initialized by coding_quadtree rather than by each CU.
 
-        self.transform_tree(pic, x0, y0, x0, y0, log2_cb_size, 0, [self.sps.chroma_format_idc != 0; 2], [self.sps.chroma_format_idc != 0; 2], chroma_modes, part_nxn)?;
+        self.transform_tree(
+            pic,
+            x0,
+            y0,
+            x0,
+            y0,
+            log2_cb_size,
+            0,
+            [self.sps.chroma_format_idc != 0; 2],
+            [self.sps.chroma_format_idc != 0; 2],
+            chroma_modes,
+            part_nxn,
+        )?;
 
         // Deblocking bookkeeping (clause 8.7.2.4): this CU's whole area
         // used `self.qp_y_prev`'s final value as its `QpY`, whether or
@@ -894,23 +969,36 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
 
         // Table 8-4 adjusts angular directions for the horizontal-only
         // chroma subsampling. Apply after resolving derived/candidate mode.
-        const ANGLES_422: [u8; 35] = [
-            0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19,
-            20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31,
-        ];
-        if self.sps.chroma_format_idc == 2 {
-            ANGLES_422.get(mode as usize).copied().ok_or(HeifError::MalformedHevc("4:2:2 chroma mode"))
-        } else { Ok(mode) }
+        const ANGLES_422: [u8; 35] =
+            [0, 1, 2, 2, 2, 2, 3, 5, 7, 8, 10, 12, 13, 15, 17, 18, 19, 20, 21, 22, 23, 23, 24, 24, 25, 25, 26, 27, 27, 28, 28, 29, 29, 30, 31];
+        if self.sps.chroma_format_idc == 2 { ANGLES_422.get(mode as usize).copied().ok_or(HeifError::MalformedHevc("4:2:2 chroma mode")) } else { Ok(mode) }
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn transform_tree(&mut self, pic: &mut Picture, x0: usize, y0: usize, x_base: usize, y_base: usize, log2_trafo_size: u32, trafo_depth: u32, cbf_cb: [bool; 2], cbf_cr: [bool; 2], chroma_modes: [u8; 4], intra_split_flag: bool) -> Result<()> {
+    fn transform_tree(
+        &mut self,
+        pic: &mut Picture,
+        x0: usize,
+        y0: usize,
+        x_base: usize,
+        y_base: usize,
+        log2_trafo_size: u32,
+        trafo_depth: u32,
+        cbf_cb: [bool; 2],
+        cbf_cr: [bool; 2],
+        chroma_modes: [u8; 4],
+        intra_split_flag: bool,
+    ) -> Result<()> {
         let max_tb_log2 = self.sps.max_tb_log2_size_y();
         let min_tb_log2 = self.sps.min_tb_log2_size_y();
         // `MaxTrafoDepth` (clause 7.4.9.8) is `max_transform_hierarchy_depth_intra
         // + IntraSplitFlag` (1 for a `PART_NxN` CU, so its forced depth-0
         // split doesn't eat into the normally-available split budget).
-        let max_trafo_depth = if self.current_intra { self.sps.max_transform_hierarchy_depth_intra + intra_split_flag as u32 } else { self.sps.max_transform_hierarchy_depth_inter };
+        let max_trafo_depth = if self.current_intra {
+            self.sps.max_transform_hierarchy_depth_intra + intra_split_flag as u32
+        } else {
+            self.sps.max_transform_hierarchy_depth_inter
+        };
         let size = 1usize << log2_trafo_size;
 
         // Clause 7.3.8.8's exact presence condition for `split_transform_flag`:
@@ -918,8 +1006,10 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
         // AND the depth limit hasn't been hit AND we're not forced to
         // split anyway (too big, or a PART_NxN CU's mandatory depth-0
         // split to match its 4 PUs); otherwise it's inferred.
-        let split = if log2_trafo_size > max_tb_log2 || (intra_split_flag && trafo_depth == 0)
-            || (!self.current_intra && max_trafo_depth == 0 && self.inter_partition_split && trafo_depth == 0) {
+        let split = if log2_trafo_size > max_tb_log2
+            || (intra_split_flag && trafo_depth == 0)
+            || (!self.current_intra && max_trafo_depth == 0 && self.inter_partition_split && trafo_depth == 0)
+        {
             true
         } else if log2_trafo_size > min_tb_log2 && trafo_depth < max_trafo_depth {
             let ctx_inc = (5 - log2_trafo_size).clamp(0, 2) as usize;
@@ -968,7 +1058,9 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
             // `CuPredMode == MODE_INTRA || trafoDepth != 0 || cbf_cb || cbf_cr`.
             // For intra coding cbf_luma is always signalled; an inter
             // root without chroma residual infers it as one.
-            let cbf_luma = if !self.current_intra && trafo_depth == 0 && !cbf_cb.iter().any(|&flag| flag) && !cbf_cr.iter().any(|&flag| flag) { true } else {
+            let cbf_luma = if !self.current_intra && trafo_depth == 0 && !cbf_cb.iter().any(|&flag| flag) && !cbf_cr.iter().any(|&flag| flag) {
+                true
+            } else {
                 let ctx_inc = (trafo_depth == 0) as usize;
                 let model = self.ctxs.cbf_luma.get_mut(ctx_inc).ok_or(HeifError::MalformedHevc("cbf_luma: context index"))?;
                 self.engine.decision(model)? == 1
@@ -979,7 +1071,21 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn transform_unit(&mut self, pic: &mut Picture, x0: usize, y0: usize, x_base: usize, y_base: usize, log2_trafo_size: u32, trafo_depth: u32, cbf_luma: bool, cbf_cb: [bool; 2], cbf_cr: [bool; 2], chroma_follows_parent: bool, chroma_mode: u8) -> Result<()> {
+    fn transform_unit(
+        &mut self,
+        pic: &mut Picture,
+        x0: usize,
+        y0: usize,
+        x_base: usize,
+        y_base: usize,
+        log2_trafo_size: u32,
+        trafo_depth: u32,
+        cbf_luma: bool,
+        cbf_cb: [bool; 2],
+        cbf_cr: [bool; 2],
+        chroma_follows_parent: bool,
+        chroma_mode: u8,
+    ) -> Result<()> {
         // clause 7.3.8.10: `cu_qp_delta_abs` is read here, at most once
         // per quantization group, and only when this TU actually has
         // some residual. A TU with every cbf flag false (e.g. a
@@ -992,14 +1098,15 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
         // Deblocking bookkeeping: this leaf luma TU's own left/top edges
         // (clause 8.7.2.4 — `bS == 2` here too; see `Picture`'s docs).
         pic.mark_tu_edges(x0, y0, 1usize << log2_trafo_size);
-        pic.mark_residual(x0,y0,1usize << log2_trafo_size,cbf_luma);
+        pic.mark_residual(x0, y0, 1usize << log2_trafo_size, cbf_luma);
 
         // Luma intra mode is looked up per-position rather than threaded
         // as a parameter: under PART_NxN each of the 4 PUs has its own
         // mode, already recorded via `Picture::set_intra_mode` when it
         // was decoded in `coding_unit`, and a plain PART_2Nx2N CU's
         // single mode covers its whole area the same way.
-        let luma_mode = pic.intra_mode_at(x0 as i64, y0 as i64).ok_or(HeifError::MalformedHevc("transform_unit: no luma intra mode recorded at this position"))?;
+        let luma_mode =
+            pic.intra_mode_at(x0 as i64, y0 as i64).ok_or(HeifError::MalformedHevc("transform_unit: no luma intra mode recorded at this position"))?;
         self.predict_and_reconstruct(pic, 0, x0, y0, log2_trafo_size, luma_mode, cbf_luma)?;
 
         if self.sps.chroma_format_idc == 0 {
@@ -1054,19 +1161,21 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
             let pred = block(&mut scratch.pred, nt)?;
             if self.current_intra {
                 let start_y = pic.slice_start_y / if cidx == 0 { 1 } else { self.sps.sub_height_c() as usize };
-                let mut border = Border::build(x0 as i64, y0 as i64, nt, bit_depth, |x, y| {
-                    if y < start_y as i64 { None } else { plane.get(x, y) }
-                })?;
-                if is_luma_or_444 { border.filter(nt, cidx, mode, bit_depth, self.sps.strong_intra_smoothing_enabled)?; }
+                let mut border = Border::build(x0 as i64, y0 as i64, nt, bit_depth, |x, y| if y < start_y as i64 { None } else { plane.get(x, y) })?;
+                if is_luma_or_444 {
+                    border.filter(nt, cidx, mode, bit_depth, self.sps.strong_intra_smoothing_enabled)?;
+                }
                 match mode {
                     0 => predict_planar(pred, nt, &border)?,
                     1 => predict_dc(pred, nt, cidx, &border)?,
                     _ => predict_angular(pred, nt, cidx, mode, bit_depth, false, &border)?,
                 }
             } else {
-                for y in 0..nt { for x in 0..nt {
-                    pred[y*nt+x] = plane.sample(x0+x,y0+y).ok_or(HeifError::MalformedHevc("inter prediction bounds"))?;
-                } }
+                for y in 0..nt {
+                    for x in 0..nt {
+                        pred[y * nt + x] = plane.sample(x0 + x, y0 + y).ok_or(HeifError::MalformedHevc("inter prediction bounds"))?;
+                    }
+                }
             }
 
             if cbf {
@@ -1088,7 +1197,16 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 };
                 let intra_pred_mode = if self.current_intra { mode as u32 } else { 0 };
                 let coeffs = block(&mut scratch.coeffs, nt)?;
-                decode_residual(self.engine, &mut self.ctxs, log2_size, cidx, intra_pred_mode, is_luma_or_444, self.pps.sign_data_hiding_enabled && !self.transquant_bypass, coeffs)?;
+                decode_residual(
+                    self.engine,
+                    &mut self.ctxs,
+                    log2_size,
+                    cidx,
+                    intra_pred_mode,
+                    is_luma_or_444,
+                    self.pps.sign_data_hiding_enabled && !self.transquant_bypass,
+                    coeffs,
+                )?;
                 let res = block(&mut scratch.residual, nt)?;
                 if self.transquant_bypass {
                     res.copy_from_slice(coeffs);
@@ -1164,27 +1282,70 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
 /// Any other non-empty `substream_starts` (e.g. tiles, which this
 /// decoder doesn't support) is rejected rather than mis-decoded.
 #[allow(clippy::too_many_arguments)]
-pub fn decode_slice(pic: &mut Picture, slice_data: &[u8], substream_starts: &[usize], sps: &Sps, pps: &Pps, slice_qp_y: i32, sao_luma: bool, sao_chroma: bool, slice_cb_qp_offset: i32, slice_cr_qp_offset: i32, inter: Option<&InterSlice>, reference: Option<&Picture>) -> Result<()> {
+pub fn decode_slice(
+    pic: &mut Picture,
+    slice_data: &[u8],
+    substream_starts: &[usize],
+    sps: &Sps,
+    pps: &Pps,
+    slice_qp_y: i32,
+    sao_luma: bool,
+    sao_chroma: bool,
+    slice_cb_qp_offset: i32,
+    slice_cr_qp_offset: i32,
+    inter: Option<&InterSlice>,
+    reference: Option<&Picture>,
+) -> Result<()> {
     let rows = (sps.pic_height_in_luma_samples as usize).div_ceil(1 << sps.ctb_log2_size_y());
-    decode_slice_rows(pic, slice_data, substream_starts, sps, pps, slice_qp_y, sao_luma, sao_chroma, slice_cb_qp_offset, slice_cr_qp_offset, inter, reference, 0, rows)
+    decode_slice_rows(
+        pic,
+        slice_data,
+        substream_starts,
+        sps,
+        pps,
+        slice_qp_y,
+        sao_luma,
+        sao_chroma,
+        slice_cb_qp_offset,
+        slice_cr_qp_offset,
+        inter,
+        reference,
+        0,
+        rows,
+    )
 }
 
 /// Decode an independent slice covering complete CTU rows. The caller
 /// rejects loop filtering across multiple slices until it is implemented.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn decode_slice_rows(pic: &mut Picture, slice_data: &[u8], substream_starts: &[usize], sps: &Sps, pps: &Pps, slice_qp_y: i32, sao_luma: bool, sao_chroma: bool, slice_cb_qp_offset: i32, slice_cr_qp_offset: i32, inter: Option<&InterSlice>, reference: Option<&Picture>, first_row: usize, end_row: usize) -> Result<()> {
+pub(crate) fn decode_slice_rows(
+    pic: &mut Picture,
+    slice_data: &[u8],
+    substream_starts: &[usize],
+    sps: &Sps,
+    pps: &Pps,
+    slice_qp_y: i32,
+    sao_luma: bool,
+    sao_chroma: bool,
+    slice_cb_qp_offset: i32,
+    slice_cr_qp_offset: i32,
+    inter: Option<&InterSlice>,
+    reference: Option<&Picture>,
+    first_row: usize,
+    end_row: usize,
+) -> Result<()> {
     let ctb_log2 = sps.ctb_log2_size_y();
     if pps.diff_cu_qp_delta_depth > sps.log2_diff_max_min_luma_coding_block_size {
         return Err(HeifError::MalformedHevc("QP: quantization group smaller than minimum CU"));
     }
-    let scaling_list = if sps.scaling_list_enabled {
-        Some(pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()).cloned().unwrap_or_default())
-    } else { None };
+    let scaling_list = if sps.scaling_list_enabled { Some(pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()).cloned().unwrap_or_default()) } else { None };
     let ctb_size = 1usize << ctb_log2;
     let pic_width_ctbs = (sps.pic_width_in_luma_samples as usize).div_ceil(ctb_size);
     let pic_height_ctbs = (sps.pic_height_in_luma_samples as usize).div_ceil(ctb_size);
 
-    if first_row >= end_row || end_row > pic_height_ctbs { return Err(HeifError::MalformedHevc("slice: invalid CTU row range")); }
+    if first_row >= end_row || end_row > pic_height_ctbs {
+        return Err(HeifError::MalformedHevc("slice: invalid CTU row range"));
+    }
     pic.slice_start_y = first_row * ctb_size;
     let slice_rows = end_row - first_row;
     let num_substreams = substream_starts.len() + 1;
@@ -1201,7 +1362,11 @@ pub(crate) fn decode_slice_rows(pic: &mut Picture, slice_data: &[u8], substream_
     let mut wpp_saved_ctx: Option<Contexts> = None;
 
     for substream_idx in 0..effective_substreams {
-        let start = if substream_idx == 0 { 0 } else { *substream_starts.get(substream_idx - 1).ok_or(HeifError::CabacDesync("decode_slice: missing substream start"))? };
+        let start = if substream_idx == 0 {
+            0
+        } else {
+            *substream_starts.get(substream_idx - 1).ok_or(HeifError::CabacDesync("decode_slice: missing substream start"))?
+        };
         let end = substream_starts.get(substream_idx).copied().unwrap_or(slice_data.len());
         let substream = slice_data.get(start..end).ok_or(HeifError::Truncated { at: start, needed: end.saturating_sub(start) })?;
 
@@ -1215,7 +1380,23 @@ pub(crate) fn decode_slice_rows(pic: &mut Picture, slice_data: &[u8], substream_
 
         let mut bits = BitReader::new(substream);
         let mut engine = Engine::new(&mut bits)?;
-        let mut decoder = Decoder { reference, inter, current_intra: true, transquant_bypass: false, inter_partition_split: false, engine: &mut engine, ctxs, sps: sps.clone(), pps: pps.clone(), scaling_list: scaling_list.as_ref(), qp_y_prev, is_cu_qp_delta_coded, slice_cb_qp_offset, slice_cr_qp_offset, scratch: BlockScratch::new() };
+        let mut decoder = Decoder {
+            reference,
+            inter,
+            current_intra: true,
+            transquant_bypass: false,
+            inter_partition_split: false,
+            engine: &mut engine,
+            ctxs,
+            sps: sps.clone(),
+            pps: pps.clone(),
+            scaling_list: scaling_list.as_ref(),
+            qp_y_prev,
+            is_cu_qp_delta_coded,
+            slice_cb_qp_offset,
+            slice_cr_qp_offset,
+            scratch: BlockScratch::new(),
+        };
 
         let row_start = first_row + substream_idx * rows_per_substream;
         let row_end = (row_start + rows_per_substream).min(end_row);

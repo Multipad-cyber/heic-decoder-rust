@@ -51,26 +51,33 @@ impl Contexts {
     /// against HM ContextTables.h. Unchanged syntax groups reuse I init.
     pub fn init_p_slice(qp: i32) -> Self {
         let mut c = Self::init_i_slice(qp);
-        c.skip = init_array([197,185,201], qp);
+        c.skip = init_array([197, 185, 201], qp);
         c.pred_mode = init_array([149], qp);
         c.merge = init_array([110], qp);
         c.merge_idx = init_array([122], qp);
         c.mvp = init_array([168], qp);
-        c.mvd = init_array([140,198], qp);
+        c.mvd = init_array([140, 198], qp);
         c.root_cbf = init_array([79], qp);
-        c.split_cu_flag = init_array([107,139,126], qp);
-        c.part_mode = init_array([154,139,154,154], qp);
+        c.split_cu_flag = init_array([107, 139, 126], qp);
+        c.part_mode = init_array([154, 139, 154, 154], qp);
         c.prev_intra_luma_pred_flag = init_array([154], qp);
         c.intra_chroma_pred_mode = init_array([152], qp);
-        c.cbf_luma = init_array([153,111], qp);
-        c.cbf_chroma = init_array([149,107,167,154], qp);
-        c.split_transform_flag = init_array([124,138,94], qp);
-        c.last_sig_coeff_x_prefix = init_array([125,110,94,110,95,79,125,111,110,78,110,111,111,95,94,108,123,108], qp);
+        c.cbf_luma = init_array([153, 111], qp);
+        c.cbf_chroma = init_array([149, 107, 167, 154], qp);
+        c.split_transform_flag = init_array([124, 138, 94], qp);
+        c.last_sig_coeff_x_prefix = init_array([125, 110, 94, 110, 95, 79, 125, 111, 110, 78, 110, 111, 111, 95, 94, 108, 123, 108], qp);
         c.last_sig_coeff_y_prefix = c.last_sig_coeff_x_prefix;
-        c.coded_sub_block_flag = init_array([121,140,61,154], qp);
-        c.significant_coeff_flag = init_array([155,154,139,153,139,123,123,63,153,166,183,140,136,153,154,166,183,140,136,153,154,166,183,140,136,153,154,170,153,123,123,107,121,107,121,167,151,183,140,151,183,140], qp);
-        c.coeff_abs_level_greater1_flag = init_array([154,196,196,167,154,152,167,182,182,134,149,136,153,121,136,137,169,194,166,167,154,167,137,182], qp);
-        c.coeff_abs_level_greater2_flag = init_array([107,167,91,122,107,167], qp);
+        c.coded_sub_block_flag = init_array([121, 140, 61, 154], qp);
+        c.significant_coeff_flag = init_array(
+            [
+                155, 154, 139, 153, 139, 123, 123, 63, 153, 166, 183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 166, 183, 140, 136, 153, 154, 170, 153,
+                123, 123, 107, 121, 107, 121, 167, 151, 183, 140, 151, 183, 140,
+            ],
+            qp,
+        );
+        c.coeff_abs_level_greater1_flag =
+            init_array([154, 196, 196, 167, 154, 152, 167, 182, 182, 134, 149, 136, 153, 121, 136, 137, 169, 194, 166, 167, 154, 167, 137, 182], qp);
+        c.coeff_abs_level_greater2_flag = init_array([107, 167, 91, 122, 107, 167], qp);
         c.sao_type_idx = init_array([185], qp);
         c
     }
@@ -79,10 +86,14 @@ impl Contexts {
     /// `SliceQpY` as the QP input to `set_initValue`.
     pub fn init_i_slice(qp: i32) -> Self {
         Contexts {
-            skip: init_array([154; 3], qp), pred_mode: init_array([154], qp),
-            merge: init_array([154], qp), merge_idx: init_array([154], qp),
+            skip: init_array([154; 3], qp),
+            pred_mode: init_array([154], qp),
+            merge: init_array([154], qp),
+            merge_idx: init_array([154], qp),
             transquant_bypass: init_array([154], qp),
-            mvp: init_array([154], qp), mvd: init_array([154; 2], qp), root_cbf: init_array([154], qp),
+            mvp: init_array([154], qp),
+            mvd: init_array([154; 2], qp),
+            root_cbf: init_array([154], qp),
             split_cu_flag: init_array([139, 141, 157], qp),
             part_mode: init_array([184, 154, 139, 154], qp),
             prev_intra_luma_pred_flag: init_array([184], qp),
@@ -95,8 +106,8 @@ impl Contexts {
             coded_sub_block_flag: init_array([91, 171, 134, 141], qp),
             significant_coeff_flag: init_array(
                 [
-                    111, 111, 125, 110, 110, 94, 124, 108, 124, 107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140, 139, 182, 182, 152, 136, 152, 136, 153,
-                    136, 139, 111, 136, 139, 111,
+                    111, 111, 125, 110, 110, 94, 124, 108, 124, 107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 107, 125, 141, 179, 153, 125, 140,
+                    139, 182, 182, 152, 136, 152, 136, 153, 136, 139, 111, 136, 139, 111,
                 ],
                 qp,
             ),

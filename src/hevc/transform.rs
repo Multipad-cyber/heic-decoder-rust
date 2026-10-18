@@ -41,8 +41,7 @@ pub fn dequant(level: i32, qp: i32, bit_depth: u32, log2_size: u32) -> Result<i3
 /// Dequantization with the selected scaling-matrix coefficient (8.6.3).
 /// `qp` includes the component's bit-depth offset, i.e. Qp' rather than Qp.
 pub fn dequant_with_scale(level: i32, qp: i32, bit_depth: u32, log2_size: u32, weight: i32) -> Result<i32> {
-    if !(8..=16).contains(&bit_depth) || !(2..=5).contains(&log2_size)
-        || !(0..=255).contains(&weight) || !(0..=51 + 6 * (bit_depth as i32 - 8)).contains(&qp) {
+    if !(8..=16).contains(&bit_depth) || !(2..=5).contains(&log2_size) || !(0..=255).contains(&weight) || !(0..=51 + 6 * (bit_depth as i32 - 8)).contains(&qp) {
         return Err(HeifError::MalformedHevc("dequant: parameter out of range"));
     }
     let shift = bit_depth + log2_size - 5;
@@ -300,11 +299,13 @@ mod tests {
             }
         }
         let shift = 20 - bit_depth;
-        (0..nt * nt).map(|k| {
-            let (y, i) = (k / nt, k % nt);
-            let sum: i64 = (0..nt).map(|j| m(j, i) * g[y * nt + j]).sum();
-            ((sum + (1 << (shift - 1))) >> shift) as i32
-        }).collect()
+        (0..nt * nt)
+            .map(|k| {
+                let (y, i) = (k / nt, k % nt);
+                let sum: i64 = (0..nt).map(|j| m(j, i) * g[y * nt + j]).sum();
+                ((sum + (1 << (shift - 1))) >> shift) as i32
+            })
+            .collect()
     }
 
     #[test]
@@ -320,11 +321,17 @@ mod tests {
             for bit_depth in [8, 10, 12] {
                 for _ in 0..200 {
                     // Mostly zeros, like real blocks, with full-range values in between.
-                    let coeffs: Vec<i32> = (0..nt * nt).map(|_| {
-                        let r = next();
-                        if r % 4 == 0 { (r >> 16) as i32 % 32768 } else { 0 }
-                    }).collect();
-                    assert_eq!(idct(&coeffs, nt, bit_depth, use_dst).unwrap(), reference(&coeffs, nt, bit_depth, use_dst), "nt={nt} dst={use_dst} bd={bit_depth}");
+                    let coeffs: Vec<i32> = (0..nt * nt)
+                        .map(|_| {
+                            let r = next();
+                            if r % 4 == 0 { (r >> 16) as i32 % 32768 } else { 0 }
+                        })
+                        .collect();
+                    assert_eq!(
+                        idct(&coeffs, nt, bit_depth, use_dst).unwrap(),
+                        reference(&coeffs, nt, bit_depth, use_dst),
+                        "nt={nt} dst={use_dst} bd={bit_depth}"
+                    );
                 }
             }
         }

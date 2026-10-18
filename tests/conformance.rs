@@ -16,18 +16,14 @@ fn enhancement_layer_nalus_are_not_base_picture_slices() {
         let data = fs::read(root.join(name)).expect("read fixture");
         let parsed = heic_decoder::isobmff::parse(&data).expect("parse fixture");
         let image = &parsed.images[0];
-        let nalus = heic_decoder::isobmff::split_length_prefixed_nalus(
-            &image.data, image.hevc_config.length_size_minus_one as usize + 1,
-        ).unwrap();
+        let nalus = heic_decoder::isobmff::split_length_prefixed_nalus(&image.data, image.hevc_config.length_size_minus_one as usize + 1).unwrap();
         assert!(nalus.iter().any(|nal| {
             let (header, _) = heic_decoder::hevc::nal::parse_nal_header(nal).unwrap();
             header.nuh_layer_id == 1 && header.nal_unit_type <= 31
         }));
         let img = heic_decoder::decode(&data).expect("decode base layer");
         assert_eq!((img.width, img.height), (width, height), "{name}");
-        let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &sample| {
-            (hash ^ sample as u64).wrapping_mul(0x100000001b3)
-        });
+        let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &sample| (hash ^ sample as u64).wrapping_mul(0x100000001b3));
         assert_eq!(hash, expected_hash, "{name}: base-layer Y/Cb/Cr must match HM");
     }
 }
@@ -87,18 +83,13 @@ fn clean_aperture_matches_reference_container_output() {
     let root = PathBuf::from(env::var_os("HEIF_CONFORMANCE_DIR").expect("set HEIF_CONFORMANCE_DIR"));
     // C013 also checked against HM samples cropped at (490,210), 300x300.
     // MIAF007 includes both clean-aperture cropping and rotation.
-    for (name, width, height, expected_hash) in [
-        ("C013.heic", 300, 300, 0x78fb02c35d5e1a41u64),
-        ("MIAF007.heic", 360, 640, 0x6086fbe32892c619u64),
-    ] {
+    for (name, width, height, expected_hash) in [("C013.heic", 300, 300, 0x78fb02c35d5e1a41u64), ("MIAF007.heic", 360, 640, 0x6086fbe32892c619u64)] {
         let data = fs::read(root.join(name)).expect("read fixture");
         let img = heic_decoder::decode(&data).expect("decode with crop");
         assert_eq!((img.width, img.height), (width, height), "{name}");
         assert_eq!((img.cb_width, img.cb_height), (width / 2, height / 2));
         assert_eq!(img.y.len() + img.cb.len() + img.cr.len(), width * height * 3 / 2);
-        let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &v| {
-            (hash ^ v as u64).wrapping_mul(0x100000001b3)
-        });
+        let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &v| (hash ^ v as u64).wrapping_mul(0x100000001b3));
         assert_eq!(hash, expected_hash, "{name}");
     }
 }
@@ -108,17 +99,12 @@ fn clean_aperture_matches_reference_container_output() {
 fn identity_items_match_reference_container_output() {
     let root = PathBuf::from(env::var_os("HEIF_CONFORMANCE_DIR").expect("set HEIF_CONFORMANCE_DIR"));
     // Independent heic-main container output, including source and iden transforms.
-    for (name, width, height, expected_hash) in [
-        ("C008.heic", 720, 1280, 0x231e2c56176b1c82u64),
-        ("C014.heic", 300, 300, 0xfa999ff7fcb06c0bu64),
-    ] {
+    for (name, width, height, expected_hash) in [("C008.heic", 720, 1280, 0x231e2c56176b1c82u64), ("C014.heic", 300, 300, 0xfa999ff7fcb06c0bu64)] {
         let data = fs::read(root.join(name)).expect("read fixture");
         let img = heic_decoder::decode(&data).expect("decode identity item");
         assert_eq!((img.width, img.height), (width, height), "{name}");
         assert_eq!((img.cb_width, img.cb_height), (width / 2, height / 2));
-        let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &v| {
-            (hash ^ v as u64).wrapping_mul(0x100000001b3)
-        });
+        let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &v| (hash ^ v as u64).wrapping_mul(0x100000001b3));
         assert_eq!(hash, expected_hash, "{name}");
     }
     let data = fs::read(root.join("C039.heic")).expect("read nested identity fixture");
@@ -126,9 +112,7 @@ fn identity_items_match_reference_container_output() {
     assert_eq!(parsed.images.len(), 1);
     let img = heic_decoder::decode(&data).expect("nested crop and rotation");
     assert_eq!((img.width, img.height, img.cb_width, img.cb_height), (150, 150, 75, 75));
-    let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &v| {
-        (hash ^ v as u64).wrapping_mul(0x100000001b3)
-    });
+    let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &v| (hash ^ v as u64).wrapping_mul(0x100000001b3));
     assert_eq!(hash, 0x115b1d7836d2e0ff);
 }
 
@@ -155,9 +139,7 @@ fn sequence_sync_frames_match_reference() {
         assert_eq!((frame.track_id, frame.sample_number, frame.sample_count), (1, 1, count), "{name}");
         let img = heic_decoder::decode(&data).expect("decode selected sync frame");
         assert_eq!((img.width, img.height), (width, height));
-        let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &v| {
-            (hash ^ v as u64).wrapping_mul(0x100000001b3)
-        });
+        let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &v| (hash ^ v as u64).wrapping_mul(0x100000001b3));
         assert_eq!(hash, expected_hash, "{name}");
     }
 }
@@ -190,9 +172,7 @@ fn predictive_primary_matches_hm() {
     assert!(heic_decoder::decode_one_image(&parsed.images[0]).is_err());
     let img = heic_decoder::decode(&data).expect("decode predictive primary");
     assert_eq!((img.width, img.height, img.cb_width, img.cb_height), (1280, 720, 640, 360));
-    let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &v| {
-        (hash ^ v as u64).wrapping_mul(0x100000001b3)
-    });
+    let hash = img.y.iter().chain(&img.cb).chain(&img.cr).fold(0xcbf29ce484222325u64, |hash, &v| (hash ^ v as u64).wrapping_mul(0x100000001b3));
     // HM POC 1 after decoding the IDR dependency, not a standalone P picture.
     assert_eq!(hash, 0x3f6d19e970c1cd10);
 }

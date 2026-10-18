@@ -239,11 +239,7 @@ pub fn rbsp_len_to_ebsp_pos(ebsp: &[u8], target_rbsp_len: usize) -> Result<usize
         produced += 1;
         zero_run = if b == 0 { zero_run + 1 } else { 0 };
     }
-    if produced == target_rbsp_len {
-        Ok(ebsp.len())
-    } else {
-        Err(HeifError::Truncated { at: ebsp.len(), needed: target_rbsp_len - produced })
-    }
+    if produced == target_rbsp_len { Ok(ebsp.len()) } else { Err(HeifError::Truncated { at: ebsp.len(), needed: target_rbsp_len - produced }) }
 }
 
 /// The RBSP length that emulation-prevention removal of the first

@@ -109,7 +109,8 @@ impl<'a, 'b> Engine<'a, 'b> {
     /// `DecodeDecision`, clause 9.3.4.3.2.
     pub fn decision(&mut self, ctx: &mut ContextModel) -> Result<u32> {
         let q_idx = ((self.range >> 6) - 4) as usize;
-        let lps_range = *LPS_RANGE.get(ctx.state as usize).and_then(|row| row.get(q_idx)).ok_or(HeifError::CabacDesync("decision: context state out of range"))?;
+        let lps_range =
+            *LPS_RANGE.get(ctx.state as usize).and_then(|row| row.get(q_idx)).ok_or(HeifError::CabacDesync("decision: context state out of range"))?;
         self.range -= lps_range;
 
         let bin_val;

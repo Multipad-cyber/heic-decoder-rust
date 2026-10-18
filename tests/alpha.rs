@@ -47,12 +47,16 @@ fn alpha_grids_transforms_mixed_depth_and_premultiplication_are_preserved() {
         assert_eq!((rgba8.data.len(), rgba16.data.len()), (width * height * 4, width * height * 4));
         assert_eq!((rgba8.premultiplied, rgba16.premultiplied), (prem, prem));
         let max = (1u64 << depth) - 1;
-        for (((pixel8, pixel16), rgb), &sample) in rgba8.data.as_chunks::<4>().0.iter().zip(rgba16.data.as_chunks::<4>().0.iter()).zip(rgb.data.as_chunks::<3>().0.iter()).zip(&alpha.samples) {
+        for (((pixel8, pixel16), rgb), &sample) in
+            rgba8.data.as_chunks::<4>().0.iter().zip(rgba16.data.as_chunks::<4>().0.iter()).zip(rgb.data.as_chunks::<3>().0.iter()).zip(&alpha.samples)
+        {
             assert_eq!(&pixel16[..3], rgb, "RGBA must preserve RGB conversion");
             assert_eq!(pixel8[3], ((sample as u64 * 255 + max / 2) / max) as u8);
             assert_eq!(pixel16[3], ((sample as u64 * 65535 + max / 2) / max) as u16);
         }
-        if depth == 10 { assert!(rgba16.data.as_chunks::<4>().0.iter().any(|p| p[3] % 257 != 0)); }
+        if depth == 10 {
+            assert!(rgba16.data.as_chunks::<4>().0.iter().any(|p| p[3] % 257 != 0));
+        }
     }
 }
 

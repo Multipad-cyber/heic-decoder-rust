@@ -50,13 +50,17 @@ pub fn parse_short_term_refs(r: &mut BitReader<'_>, index: usize, sets: &[ShortT
             let used = r.flag()?;
             let retained = used || r.flag()?;
             let poc = poc.checked_add(delta).ok_or(HeifError::MalformedHevc("RPS POC overflow"))?;
-            if retained && poc != 0 { values.push((poc, used)); }
+            if retained && poc != 0 {
+                values.push((poc, used));
+            }
         }
         values.sort_by_key(|&(poc, _)| if poc < 0 { (0, -i64::from(poc)) } else { (1, i64::from(poc)) });
     } else {
         let negative = r.ue()?;
         let positive = r.ue()?;
-        if negative > 16 || positive > 16 || negative + positive > 16 { return Err(HeifError::Unsupported("RPS: too many reference pictures")); }
+        if negative > 16 || positive > 16 || negative + positive > 16 {
+            return Err(HeifError::Unsupported("RPS: too many reference pictures"));
+        }
         for (count, sign) in [(negative, -1i32), (positive, 1i32)] {
             let mut poc = 0i32;
             for _ in 0..count {
@@ -66,7 +70,9 @@ pub fn parse_short_term_refs(r: &mut BitReader<'_>, index: usize, sets: &[ShortT
             }
         }
     }
-    if values.len() > 16 { return Err(HeifError::Unsupported("RPS: too many reference pictures")); }
+    if values.len() > 16 {
+        return Err(HeifError::Unsupported("RPS: too many reference pictures"));
+    }
     Ok(ShortTermRefs(values))
 }
 
@@ -117,19 +123,11 @@ impl Sps {
     }
 
     pub fn sub_width_c(&self) -> u32 {
-        if self.chroma_format_idc == 1 || self.chroma_format_idc == 2 {
-            2
-        } else {
-            1
-        }
+        if self.chroma_format_idc == 1 || self.chroma_format_idc == 2 { 2 } else { 1 }
     }
 
     pub fn sub_height_c(&self) -> u32 {
-        if self.chroma_format_idc == 1 {
-            2
-        } else {
-            1
-        }
+        if self.chroma_format_idc == 1 { 2 } else { 1 }
     }
 }
 
@@ -166,7 +164,8 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
         }
         let [left, right, top, bottom] = conformance_window;
         if left.checked_add(right).is_none_or(|crop| crop >= pic_width_in_luma_samples)
-            || top.checked_add(bottom).is_none_or(|crop| crop >= pic_height_in_luma_samples) {
+            || top.checked_add(bottom).is_none_or(|crop| crop >= pic_height_in_luma_samples)
+        {
             return Err(HeifError::MalformedHevc("SPS: conformance window exceeds picture"));
         }
     }
@@ -186,11 +185,14 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     // and transform depths at most CtbLog2SizeY - MinTbLog2SizeY.
     let log2_min_luma_coding_block_size = r.ue()?.checked_add(3).ok_or(HeifError::MalformedHevc("SPS: coding block size"))?;
     let log2_diff_max_min_luma_coding_block_size = r.ue()?;
-    let ctb_log2 = log2_min_luma_coding_block_size.checked_add(log2_diff_max_min_luma_coding_block_size)
-        .filter(|v| (4..=6).contains(v)).ok_or(HeifError::MalformedHevc("SPS: CTB size"))?;
+    let ctb_log2 = log2_min_luma_coding_block_size
+        .checked_add(log2_diff_max_min_luma_coding_block_size)
+        .filter(|v| (4..=6).contains(v))
+        .ok_or(HeifError::MalformedHevc("SPS: CTB size"))?;
     let log2_min_luma_transform_block_size = r.ue()?.checked_add(2).ok_or(HeifError::MalformedHevc("SPS: transform block size"))?;
     let log2_diff_max_min_luma_transform_block_size = r.ue()?;
-    let max_tb_log2 = log2_min_luma_transform_block_size.checked_add(log2_diff_max_min_luma_transform_block_size)
+    let max_tb_log2 = log2_min_luma_transform_block_size
+        .checked_add(log2_diff_max_min_luma_transform_block_size)
         .ok_or(HeifError::MalformedHevc("SPS: transform block size"))?;
     if log2_min_luma_transform_block_size >= log2_min_luma_coding_block_size || max_tb_log2 > ctb_log2.min(5) {
         return Err(HeifError::MalformedHevc("SPS: transform block size"));
@@ -228,9 +230,7 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     }
     let temporal_mvp_enabled = r.flag()?;
     let strong_intra_smoothing_enabled = r.flag()?;
-    let (color_info, chroma_location) = if r.more_rbsp_data() && r.flag()? {
-        parse_vui(&mut r)?
-    } else { (None, None) };
+    let (color_info, chroma_location) = if r.more_rbsp_data() && r.flag()? { parse_vui(&mut r)? } else { (None, None) };
     // Range-extension coding tools change residual decoding and prediction.
     // Reject them instead of silently producing wrong samples.
     if r.more_rbsp_data() && r.flag()? {
@@ -244,7 +244,9 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
     }
 
     Ok(Sps {
-        log2_max_pic_order_cnt_lsb, short_term_refs, temporal_mvp_enabled,
+        log2_max_pic_order_cnt_lsb,
+        short_term_refs,
+        temporal_mvp_enabled,
         chroma_format_idc,
         pic_width_in_luma_samples,
         pic_height_in_luma_samples,
@@ -271,35 +273,53 @@ pub fn parse_sps(rbsp: &[u8]) -> Result<Sps> {
 // Parse the VUI prefix through chroma location. Remaining display/timing
 // and HRD syntax is irrelevant to decoding a progressive still image.
 fn parse_vui(r: &mut BitReader<'_>) -> Result<(Option<crate::color::ColorInfo>, Option<u32>)> {
-    if r.flag()? && r.bits(8)? == 255 { r.bits(16)?; r.bits(16)?; }
-    if r.flag()? { r.bit()?; } // overscan
+    if r.flag()? && r.bits(8)? == 255 {
+        r.bits(16)?;
+        r.bits(16)?;
+    }
+    if r.flag()? {
+        r.bit()?;
+    } // overscan
     let color = if r.flag()? {
         r.bits(3)?; // video_format
         let full_range = r.flag()?;
-        let (color_primaries, transfer_characteristics, matrix_coefficients) = if r.flag()? {
-            (r.bits(8)? as u16, r.bits(8)? as u16, r.bits(8)? as u16)
-        } else { (2, 2, 2) };
+        let (color_primaries, transfer_characteristics, matrix_coefficients) =
+            if r.flag()? { (r.bits(8)? as u16, r.bits(8)? as u16, r.bits(8)? as u16) } else { (2, 2, 2) };
         Some(crate::color::ColorInfo { color_primaries, transfer_characteristics, matrix_coefficients, full_range })
-    } else { None };
+    } else {
+        None
+    };
     let location = if r.flag()? {
         let top = r.ue()?;
         let bottom = r.ue()?;
-        if top > 5 || bottom > 5 { return Err(HeifError::MalformedHevc("VUI: chroma location out of range")); }
+        if top > 5 || bottom > 5 {
+            return Err(HeifError::MalformedHevc("VUI: chroma location out of range"));
+        }
         Some(top)
-    } else { None };
+    } else {
+        None
+    };
     r.bits(3)?; // neutral_chroma_indication, field_seq, frame_field_info_present
     if r.flag()? {
-        for _ in 0..4 { r.ue()?; } // default display window
+        for _ in 0..4 {
+            r.ue()?;
+        } // default display window
     }
     if r.flag()? {
         r.bits(32)?; // vui_num_units_in_tick
         r.bits(32)?; // vui_time_scale
-        if r.flag()? { r.ue()?; } // vui_num_ticks_poc_diff_one_minus1
-        if r.flag()? { skip_hrd_parameters(r)?; }
+        if r.flag()? {
+            r.ue()?;
+        } // vui_num_ticks_poc_diff_one_minus1
+        if r.flag()? {
+            skip_hrd_parameters(r)?;
+        }
     }
     if r.flag()? {
         r.bits(3)?; // tiles_fixed_structure, motion_vectors_over_pic_boundaries, restricted_ref_pic_lists
-        for _ in 0..5 { r.ue()?; }
+        for _ in 0..5 {
+            r.ue()?;
+        }
     }
     Ok((color, location))
 }
@@ -311,21 +331,31 @@ fn skip_hrd_parameters(r: &mut BitReader<'_>) -> Result<()> {
     let mut sub_pic_hrd = false;
     if nal_hrd || vcl_hrd {
         sub_pic_hrd = r.flag()?;
-        if sub_pic_hrd { r.bits(19)?; } // tick divisor, DU delay lengths, SEI flag
+        if sub_pic_hrd {
+            r.bits(19)?;
+        } // tick divisor, DU delay lengths, SEI flag
         r.bits(8)?; // bit_rate_scale, cpb_size_scale
-        if sub_pic_hrd { r.bits(4)?; } // cpb_size_du_scale
+        if sub_pic_hrd {
+            r.bits(4)?;
+        } // cpb_size_du_scale
         r.bits(15)?; // initial/AU CPB removal and DPB output delay lengths
     }
     let fixed_pic_rate_within_cvs = r.flag()? || r.flag()?;
-    let low_delay = if fixed_pic_rate_within_cvs { r.ue()?; false } else { r.flag()? };
-    let cpb_count = if low_delay { 1 } else {
-        r.ue()?.checked_add(1).filter(|n| *n <= 32).ok_or(HeifError::MalformedHevc("HRD: cpb_cnt_minus1"))?
+    let low_delay = if fixed_pic_rate_within_cvs {
+        r.ue()?;
+        false
+    } else {
+        r.flag()?
     };
+    let cpb_count = if low_delay { 1 } else { r.ue()?.checked_add(1).filter(|n| *n <= 32).ok_or(HeifError::MalformedHevc("HRD: cpb_cnt_minus1"))? };
     for _ in 0..u32::from(nal_hrd) + u32::from(vcl_hrd) {
         for _ in 0..cpb_count {
             r.ue()?; // bit_rate_value_minus1
             r.ue()?; // cpb_size_value_minus1
-            if sub_pic_hrd { r.ue()?; r.ue()?; }
+            if sub_pic_hrd {
+                r.ue()?;
+                r.ue()?;
+            }
             r.bit()?; // cbr_flag
         }
     }
@@ -441,18 +471,27 @@ pub fn parse_pps(rbsp: &[u8]) -> Result<Pps> {
             if transform_skip_enabled && r.ue()? != 0 {
                 return Err(HeifError::Unsupported("PPS: transform skip larger than 4x4"));
             }
-            if r.flag()? { return Err(HeifError::Unsupported("PPS: cross-component prediction")); }
-            if r.flag()? { return Err(HeifError::Unsupported("PPS: chroma QP offset list")); }
+            if r.flag()? {
+                return Err(HeifError::Unsupported("PPS: cross-component prediction"));
+            }
+            if r.flag()? {
+                return Err(HeifError::Unsupported("PPS: chroma QP offset list"));
+            }
             for scale in &mut sao_offset_scale {
                 *scale = r.ue()?;
-                if *scale > 6 { return Err(HeifError::MalformedHevc("PPS: SAO offset scale")); }
+                if *scale > 6 {
+                    return Err(HeifError::MalformedHevc("PPS: SAO offset scale"));
+                }
             }
         }
     }
 
     Ok(Pps {
         sao_offset_scale,
-        default_l0_references, weighted_pred, lists_modification_present, log2_parallel_merge_level,
+        default_l0_references,
+        weighted_pred,
+        lists_modification_present,
+        log2_parallel_merge_level,
         dependent_slice_segments_enabled,
         output_flag_present,
         num_extra_slice_header_bits,
@@ -509,11 +548,35 @@ mod tests {
     }
 
     /// The SPS fields the validation tests vary; `Default` is the minimal SPS.
-    struct SpsFields { width: u32, height: u32, chroma: u32, crop: Option<[u32; 4]>, bit_depth_minus8: u32, min_cb_minus3: u32, diff_cb: u32, min_tb_minus2: u32, diff_tb: u32, depth_intra: u32, tail: Vec<u8> }
+    struct SpsFields {
+        width: u32,
+        height: u32,
+        chroma: u32,
+        crop: Option<[u32; 4]>,
+        bit_depth_minus8: u32,
+        min_cb_minus3: u32,
+        diff_cb: u32,
+        min_tb_minus2: u32,
+        diff_tb: u32,
+        depth_intra: u32,
+        tail: Vec<u8>,
+    }
 
     impl Default for SpsFields {
         fn default() -> Self {
-            SpsFields { width: 15, height: 15, chroma: 1, crop: None, bit_depth_minus8: 0, min_cb_minus3: 0, diff_cb: 1, min_tb_minus2: 0, diff_tb: 1, depth_intra: 0, tail: Vec::new() }
+            SpsFields {
+                width: 15,
+                height: 15,
+                chroma: 1,
+                crop: None,
+                bit_depth_minus8: 0,
+                min_cb_minus3: 0,
+                diff_cb: 1,
+                min_tb_minus2: 0,
+                diff_tb: 1,
+                depth_intra: 0,
+                tail: Vec::new(),
+            }
         }
     }
 
@@ -530,12 +593,16 @@ mod tests {
         push_bits(&mut bits, 0, 96);
         push_ue(&mut bits, 0); // sps_seq_parameter_set_id
         push_ue(&mut bits, f.chroma);
-        if f.chroma == 3 { push_bits(&mut bits, 0, 1); } // separate_colour_plane_flag
+        if f.chroma == 3 {
+            push_bits(&mut bits, 0, 1);
+        } // separate_colour_plane_flag
         push_ue(&mut bits, f.width); // pic_width_in_luma_samples (literal ue(v), not minus-anything)
         push_ue(&mut bits, f.height); // pic_height_in_luma_samples
         push_bits(&mut bits, u32::from(f.crop.is_some()), 1);
         if let Some(crop) = f.crop {
-            for offset in crop { push_ue(&mut bits, offset); }
+            for offset in crop {
+                push_ue(&mut bits, offset);
+            }
         }
         push_ue(&mut bits, f.bit_depth_minus8); // bit_depth_luma_minus8
         push_ue(&mut bits, 0); // bit_depth_chroma_minus8 = 0
@@ -603,7 +670,9 @@ mod tests {
             push_bits(&mut b, 0x01_01_01, 24); // BT.709 primaries, transfer and matrix
             push_bits(&mut b, 0b0000, 4); // no chroma location; neutral/field/frame-field flags
             push_bits(&mut b, 1, 1); // default display window
-            for v in [1, 2, 3, 4] { push_ue(&mut b, v); }
+            for v in [1, 2, 3, 4] {
+                push_ue(&mut b, v);
+            }
             push_bits(&mut b, 1, 1); // timing info
             push_bits(&mut b, 1001, 32);
             push_bits(&mut b, 60000, 32);
@@ -616,18 +685,34 @@ mod tests {
             push_bits(&mut b, 1, 1); // fixed_pic_rate_general_flag
             push_ue(&mut b, 0); // elemental_duration_in_tc_minus1; low_delay_hrd_flag is absent
             push_ue(&mut b, 1); // two CPB specifications
-            for _ in 0..2 { push_ue(&mut b, 5); push_ue(&mut b, 7); push_bits(&mut b, 1, 1); }
+            for _ in 0..2 {
+                push_ue(&mut b, 5);
+                push_ue(&mut b, 7);
+                push_bits(&mut b, 1, 1);
+            }
             push_bits(&mut b, 1, 1); // bitstream restriction
             push_bits(&mut b, 0, 3);
-            for v in [0, 2, 1, 15, 15] { push_ue(&mut b, v); }
+            for v in [0, 2, 1, 15, 15] {
+                push_ue(&mut b, v);
+            }
             match range_extension {
                 None => push_bits(&mut b, 0, 1),
-                Some(flags) => { push_bits(&mut b, 1, 1); push_bits(&mut b, 0b1000_0000, 8); push_bits(&mut b, flags, 9); }
+                Some(flags) => {
+                    push_bits(&mut b, 1, 1);
+                    push_bits(&mut b, 0b1000_0000, 8);
+                    push_bits(&mut b, flags, 9);
+                }
             }
             b
         };
-        for (flags, supported) in [(None, true), (Some(0), true), (Some(0b000_000_100), true),
-                                   (Some(0b000_001_000), false), (Some(0b100_000_000), false), (Some(0b000_000_001), false)] {
+        for (flags, supported) in [
+            (None, true),
+            (Some(0), true),
+            (Some(0b000_000_100), true),
+            (Some(0b000_001_000), false),
+            (Some(0b100_000_000), false),
+            (Some(0b000_000_001), false),
+        ] {
             let sps = parse_sps(&sps_bits(false, &SpsFields { tail: vui(flags), ..Default::default() }));
             match sps {
                 Ok(sps) => {
@@ -718,7 +803,9 @@ mod tests {
         push_bits(&mut bits, 0, 8); // chroma offsets through deblocking-control flags
         push_bits(&mut bits, 1, 1); // PPS scaling list present
         push_bits(&mut bits, 1, 1); // first matrix uses explicit coefficients
-        for _ in 0..16 { push_bits(&mut bits, 1, 1); } // se(0): each coefficient stays 8
+        for _ in 0..16 {
+            push_bits(&mut bits, 1, 1);
+        } // se(0): each coefficient stays 8
         for _ in 1..20 {
             push_bits(&mut bits, 0, 1); // predicted matrix
             push_ue(&mut bits, 0); // default
@@ -726,8 +813,7 @@ mod tests {
         push_bits(&mut bits, 0, 1); // lists_modification_present_flag
         push_ue(&mut bits, 0); // parallel merge level
         push_bits(&mut bits, 0, 1); // slice header extension
-        let bytes: Vec<u8> = bits.chunks(8).map(|chunk| chunk.iter().enumerate()
-            .fold(0, |byte, (i, bit)| byte | (bit << (7 - i)))).collect();
+        let bytes: Vec<u8> = bits.chunks(8).map(|chunk| chunk.iter().enumerate().fold(0, |byte, (i, bit)| byte | (bit << (7 - i)))).collect();
         let pps = parse_pps(&bytes).unwrap();
         let list = pps.scaling_list.unwrap();
         assert_eq!(list.weight(2, 0, 0, 0).unwrap(), 8);

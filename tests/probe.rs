@@ -1,5 +1,5 @@
 //! `probe` must predict what decoding returns, with and without transforms.
-use heic_decoder::{decode_with, probe, DecodeOptions};
+use heic_decoder::{DecodeOptions, decode_with, probe};
 
 #[test]
 fn probe_matches_decoded_geometry_depth_and_alpha() {
@@ -8,7 +8,9 @@ fn probe_matches_decoded_geometry_depth_and_alpha() {
     for group in ["422", "alpha", "crop", "rgb"] {
         for entry in std::fs::read_dir(dir.join(group)).unwrap() {
             let path = entry.unwrap().path();
-            if path.extension().is_none_or(|e| e != "heic") { continue; }
+            if path.extension().is_none_or(|e| e != "heic") {
+                continue;
+            }
             let bytes = std::fs::read(&path).unwrap();
             let info = probe(&bytes).unwrap();
             let shown = decode_with(&bytes, &DecodeOptions::default()).unwrap();
@@ -16,11 +18,16 @@ fn probe_matches_decoded_geometry_depth_and_alpha() {
             let name = path.display();
             assert_eq!((info.width, info.height), (shown.width, shown.height), "{name}");
             assert_eq!((info.coded_width, info.coded_height), (coded.width, coded.height), "{name}");
-            assert_eq!((info.bit_depth_luma, info.bit_depth_chroma, info.chroma_format_idc),
-                (shown.bit_depth_luma, shown.bit_depth_chroma, shown.chroma_format_idc), "{name}");
+            assert_eq!(
+                (info.bit_depth_luma, info.bit_depth_chroma, info.chroma_format_idc),
+                (shown.bit_depth_luma, shown.bit_depth_chroma, shown.chroma_format_idc),
+                "{name}"
+            );
             assert_eq!(info.alpha_bit_depth, shown.alpha.as_ref().map(|a| a.bit_depth), "{name}");
             for image in [&shown, &coded] {
-                if let Some(alpha) = &image.alpha { assert_eq!(alpha.samples.len(), image.width * image.height, "{name}"); }
+                if let Some(alpha) = &image.alpha {
+                    assert_eq!(alpha.samples.len(), image.width * image.height, "{name}");
+                }
             }
             checked += 1;
         }

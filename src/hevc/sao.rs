@@ -42,7 +42,9 @@ fn apply_band(snapshot: &[i32], dst: &mut [i32], width: usize, x0: usize, y0: us
             let Some(&sample) = snapshot.get(idx) else { continue };
             let band = (sample.clamp(0, max_val) >> band_shift) as usize;
             let offset = band_table.get(band).copied().unwrap_or(0);
-            if offset != 0 && let Some(d) = dst.get_mut(idx) {
+            if offset != 0
+                && let Some(d) = dst.get_mut(idx)
+            {
                 *d = (sample + offset).clamp(0, max_val);
             }
         }
@@ -50,7 +52,19 @@ fn apply_band(snapshot: &[i32], dst: &mut [i32], width: usize, x0: usize, y0: us
 }
 
 #[allow(clippy::too_many_arguments)]
-fn apply_edge(snapshot: &[i32], dst: &mut [i32], width: usize, height: usize, x0: usize, y0: usize, w: usize, h: usize, eo_class: u8, offsets: [i32; 4], bit_depth: u32) {
+fn apply_edge(
+    snapshot: &[i32],
+    dst: &mut [i32],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    eo_class: u8,
+    offsets: [i32; 4],
+    bit_depth: u32,
+) {
     let max_val = (1i32 << bit_depth) - 1;
     let (dx0, dy0, dx1, dy1) = EO_OFFSETS[eo_class as usize & 3];
     // Categories 1,2 (table index 0,1) add a positive offset; 3,4
@@ -74,7 +88,9 @@ fn apply_edge(snapshot: &[i32], dst: &mut [i32], width: usize, height: usize, x0
             let Some(&n1) = snapshot.get(ny1 as usize * width + nx1 as usize) else { continue };
             let edge_idx = (2 + (sample - n0).signum() + (sample - n1).signum()) as usize;
             let offset = table.get(edge_idx).copied().unwrap_or(0);
-            if offset != 0 && let Some(d) = dst.get_mut(idx) {
+            if offset != 0
+                && let Some(d) = dst.get_mut(idx)
+            {
                 *d = (sample + offset).clamp(0, max_val);
             }
         }
@@ -89,7 +105,19 @@ fn apply_edge(snapshot: &[i32], dst: &mut [i32], width: usize, height: usize, x0
 /// run concurrently with a mutable borrow of the one plane it's
 /// actually editing.
 #[allow(clippy::too_many_arguments)]
-fn apply_component(sao: &[SaoCtbParams], pic_width_ctbs: usize, pic_height_ctbs: usize, cidx: usize, width: usize, height: usize, ctb_width: usize, ctb_height: usize, bit_depth: u32, snapshot: &[i32], dst: &mut [i32]) {
+fn apply_component(
+    sao: &[SaoCtbParams],
+    pic_width_ctbs: usize,
+    pic_height_ctbs: usize,
+    cidx: usize,
+    width: usize,
+    height: usize,
+    ctb_width: usize,
+    ctb_height: usize,
+    bit_depth: u32,
+    snapshot: &[i32],
+    dst: &mut [i32],
+) {
     for ctb_y in 0..pic_height_ctbs {
         for ctb_x in 0..pic_width_ctbs {
             let Some(&params) = sao.get(ctb_y * pic_width_ctbs + ctb_x) else { continue };
@@ -125,7 +153,9 @@ pub fn apply_sao(pic: &mut Picture, sps: &Sps, sao_luma: bool, sao_chroma: bool)
         let (width, height) = (pic.y.width, pic.y.height);
         let snapshot = pic.y.samples().to_vec();
         apply_component(&sao, pic_width_ctbs, pic_height_ctbs, 0, width, height, ctb_pixel, ctb_pixel, pic.y.bit_depth, &snapshot, pic.y.samples_mut());
-        if restore_bypass { pic.restore_bypass(0, &snapshot, 1, 1); }
+        if restore_bypass {
+            pic.restore_bypass(0, &snapshot, 1, 1);
+        }
     }
     if sao_chroma && sps.chroma_format_idc != 0 {
         let chroma_ctb_width = ctb_pixel / sps.sub_width_c() as usize;
@@ -133,13 +163,41 @@ pub fn apply_sao(pic: &mut Picture, sps: &Sps, sao_luma: bool, sao_chroma: bool)
 
         let (cb_width, cb_height) = (pic.cb.width, pic.cb.height);
         let snapshot_cb = pic.cb.samples().to_vec();
-        apply_component(&sao, pic_width_ctbs, pic_height_ctbs, 1, cb_width, cb_height, chroma_ctb_width, chroma_ctb_height, pic.cb.bit_depth, &snapshot_cb, pic.cb.samples_mut());
-        if restore_bypass { pic.restore_bypass(1, &snapshot_cb, sps.sub_width_c() as usize, sps.sub_height_c() as usize); }
+        apply_component(
+            &sao,
+            pic_width_ctbs,
+            pic_height_ctbs,
+            1,
+            cb_width,
+            cb_height,
+            chroma_ctb_width,
+            chroma_ctb_height,
+            pic.cb.bit_depth,
+            &snapshot_cb,
+            pic.cb.samples_mut(),
+        );
+        if restore_bypass {
+            pic.restore_bypass(1, &snapshot_cb, sps.sub_width_c() as usize, sps.sub_height_c() as usize);
+        }
 
         let (cr_width, cr_height) = (pic.cr.width, pic.cr.height);
         let snapshot_cr = pic.cr.samples().to_vec();
-        apply_component(&sao, pic_width_ctbs, pic_height_ctbs, 2, cr_width, cr_height, chroma_ctb_width, chroma_ctb_height, pic.cr.bit_depth, &snapshot_cr, pic.cr.samples_mut());
-        if restore_bypass { pic.restore_bypass(2, &snapshot_cr, sps.sub_width_c() as usize, sps.sub_height_c() as usize); }
+        apply_component(
+            &sao,
+            pic_width_ctbs,
+            pic_height_ctbs,
+            2,
+            cr_width,
+            cr_height,
+            chroma_ctb_width,
+            chroma_ctb_height,
+            pic.cr.bit_depth,
+            &snapshot_cr,
+            pic.cr.samples_mut(),
+        );
+        if restore_bypass {
+            pic.restore_bypass(2, &snapshot_cr, sps.sub_width_c() as usize, sps.sub_height_c() as usize);
+        }
     }
     Ok(())
 }
@@ -160,7 +218,11 @@ mod tests {
         params.offsets[0] = [3, 0, 0, 0];
         apply_component(&[params], 1, 1, 0, 8, 4, 16, 16, 8, &snapshot, pic.y.samples_mut());
         pic.restore_bypass(0, &snapshot, 1, 1);
-        for y in 0..4 { for x in 0..8 { assert_eq!(pic.y.sample(x, y), Some(if x < 4 { 10 } else { 13 })); } }
+        for y in 0..4 {
+            for x in 0..8 {
+                assert_eq!(pic.y.sample(x, y), Some(if x < 4 { 10 } else { 13 }));
+            }
+        }
     }
 
     /// 8-bit band offset: `band = sample >> 3`, so samples 10/40/70/100

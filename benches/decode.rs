@@ -11,7 +11,7 @@
 //! Run with: `HEIF_CONFORMANCE_DIR=/path/to/conformance_files cargo bench --bench decode`
 //! Run specific group: `cargo bench --bench decode -- container_parse`
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use std::fs;
 
 const FILES: [&str; 2] = ["C001.heic", "C013.heic"];
@@ -29,9 +29,7 @@ fn container_parse(c: &mut Criterion) {
 
     for name in FILES {
         if let Some(bytes) = fixture(name) {
-            group.bench_function(name, |b| {
-                b.iter(|| heic_decoder::isobmff::parse(black_box(&bytes)))
-            });
+            group.bench_function(name, |b| b.iter(|| heic_decoder::isobmff::parse(black_box(&bytes))));
         }
     }
     group.finish();
@@ -48,13 +46,9 @@ fn decode_file(c: &mut Criterion) {
         if let Some(bytes) = fixture(name) {
             // Measure throughput in pixels decoded
             if let Ok(img) = heic_decoder::decode(&bytes) {
-                group.throughput(Throughput::Elements(
-                    (img.width as u64) * (img.height as u64),
-                ));
+                group.throughput(Throughput::Elements((img.width as u64) * (img.height as u64)));
             }
-            group.bench_function(name, |b| {
-                b.iter(|| heic_decoder::decode(black_box(&bytes)))
-            });
+            group.bench_function(name, |b| b.iter(|| heic_decoder::decode(black_box(&bytes))));
         }
     }
     group.finish();

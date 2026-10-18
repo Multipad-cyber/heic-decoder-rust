@@ -13,7 +13,7 @@
 
 use super::cabac::Engine;
 use super::contexts::Contexts;
-use super::scan::{intra_scan_idx, scan_order, Pos};
+use super::scan::{Pos, intra_scan_idx, scan_order};
 use crate::error::{HeifError, Result};
 
 /// `ctxIdxMap[16]` (clause 9.3.4.2.5), used only for 4x4 ( `log2TrafoSize
@@ -113,11 +113,7 @@ fn sig_ctx(x: u32, y: u32, sb_width: u32, cidx: usize, scan_idx: u32, prev_csbf:
 
 fn sig_coeff_ctx_inc(x: u32, y: u32, sb_width: u32, cidx: usize, scan_idx: u32, prev_csbf: u32) -> u32 {
     let sig = sig_ctx(x, y, sb_width, cidx, scan_idx, prev_csbf);
-    if cidx == 0 {
-        sig
-    } else {
-        27 + sig
-    }
+    if cidx == 0 { sig } else { 27 + sig }
 }
 
 fn decode_coeff_abs_level_remaining(engine: &mut Engine, rice_param: u32) -> Result<u32> {
@@ -197,10 +193,14 @@ pub fn decode_residual(
         };
 
         if sub_block_is_coded {
-            if s.x > 0 && let Some(n) = coded_sub_block_neighbors.get_mut((s.x - 1 + s.y * sb_width) as usize) {
+            if s.x > 0
+                && let Some(n) = coded_sub_block_neighbors.get_mut((s.x - 1 + s.y * sb_width) as usize)
+            {
                 *n |= 1;
             }
-            if s.y > 0 && let Some(n) = coded_sub_block_neighbors.get_mut((s.x + (s.y - 1) * sb_width) as usize) {
+            if s.y > 0
+                && let Some(n) = coded_sub_block_neighbors.get_mut((s.x + (s.y - 1) * sb_width) as usize)
+            {
                 *n |= 2;
             }
         }
@@ -276,7 +276,8 @@ pub fn decode_residual(
         let mut new_last_g1_pos: Option<usize> = None;
         for (c, lvl) in level.iter_mut().enumerate().take(last_g1) {
             let ctx_inc = (ctx_set_base * 4 + greater1_ctx.min(3)) as u32 + if is_chroma { 16 } else { 0 };
-            let model = ctxs.coeff_abs_level_greater1_flag.get_mut(ctx_inc as usize).ok_or(HeifError::MalformedHevc("coeff_abs_level_greater1_flag: context index"))?;
+            let model =
+                ctxs.coeff_abs_level_greater1_flag.get_mut(ctx_inc as usize).ok_or(HeifError::MalformedHevc("coeff_abs_level_greater1_flag: context index"))?;
             let flag = engine.decision(model)?;
             if flag == 1 {
                 *lvl += 1;
@@ -297,7 +298,8 @@ pub fn decode_residual(
 
         if let Some(pos) = new_last_g1_pos {
             let ctx_inc = ctx_set_base as u32 + if is_chroma { 4 } else { 0 };
-            let model = ctxs.coeff_abs_level_greater2_flag.get_mut(ctx_inc as usize).ok_or(HeifError::MalformedHevc("coeff_abs_level_greater2_flag: context index"))?;
+            let model =
+                ctxs.coeff_abs_level_greater2_flag.get_mut(ctx_inc as usize).ok_or(HeifError::MalformedHevc("coeff_abs_level_greater2_flag: context index"))?;
             let flag = engine.decision(model)?;
             if let Some(lvl) = level.get_mut(pos) {
                 *lvl += flag as i32;
@@ -320,7 +322,9 @@ pub fn decode_residual(
         for s in sign.iter_mut().take(n_coeff - 1) {
             *s = engine.bypass()? == 1;
         }
-        if (!sign_data_hiding_enabled || !sign_hidden) && let Some(s) = sign.get_mut(n_coeff - 1) {
+        if (!sign_data_hiding_enabled || !sign_hidden)
+            && let Some(s) = sign.get_mut(n_coeff - 1)
+        {
             *s = engine.bypass()? == 1;
         }
 
