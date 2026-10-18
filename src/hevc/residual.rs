@@ -52,10 +52,10 @@ fn decode_last_sig_coeff_value(engine: &mut Engine, prefix: u32) -> Result<u32> 
 /// `sigCtx` derivation (clause 9.3.4.2.5), for a coefficient at `(x, y)`
 /// within an `nt x nt` block whose containing 4x4 subblock has coded-flag
 /// neighbours `prev_csbf` (bit0 = right neighbour coded, bit1 = below).
-fn sig_ctx(x: u32, y: u32, sb_width: u32, cidx: usize, scan_idx: u32, prev_csbf: u32) -> u32 {
+const fn sig_ctx(x: u32, y: u32, sb_width: u32, cidx: usize, scan_idx: u32, prev_csbf: u32) -> u32 {
     if sb_width == 1 {
         let idx = ((y << 2) + x) as usize;
-        return CTX_IDX_MAP_4X4.get(idx).copied().unwrap_or(0) as u32;
+        return if idx < CTX_IDX_MAP_4X4.len() { CTX_IDX_MAP_4X4[idx] as u32 } else { 0 };
     }
     if x + y == 0 {
         return 0;
@@ -111,9 +111,41 @@ fn sig_ctx(x: u32, y: u32, sb_width: u32, cidx: usize, scan_idx: u32, prev_csbf:
     sig
 }
 
-fn sig_coeff_ctx_inc(x: u32, y: u32, sb_width: u32, cidx: usize, scan_idx: u32, prev_csbf: u32) -> u32 {
+const fn sig_coeff_ctx_inc(x: u32, y: u32, sb_width: u32, cidx: usize, scan_idx: u32, prev_csbf: u32) -> u32 {
     let sig = sig_ctx(x, y, sb_width, cidx, scan_idx, prev_csbf);
     if cidx == 0 { sig } else { 27 + sig }
+}
+
+/// [`sig_coeff_ctx_inc`] for every case, so the significance loop reads one
+/// table entry per coefficient. It depends on the block only through the
+/// transform size, luma/chroma, scan order, the coded-subblock neighbours
+/// and whether the subblock is the block's first; a row holds the 16
+/// positions of one subblock, indexed `yp * 4 + xp`. See [`sig_ctx_row`].
+const SIG_CTX: [[u8; 16]; 4 * 2 * 3 * 4 * 2] = {
+    let mut table = [[0u8; 16]; 4 * 2 * 3 * 4 * 2];
+    let mut row = 0;
+    while row < table.len() {
+        let (not_first, prev_csbf, scan_idx, chroma, size) = (row % 2, row / 2 % 4, row / 8 % 3, row / 24 % 2, row / 48);
+        let mut pos = 0;
+        while pos < 16 {
+            // Any subblock other than the first gives the same contexts; take the one to its right.
+            let (x, y) = ((not_first * 4 + pos % 4) as u32, (pos / 4) as u32);
+            table[row][pos] = sig_coeff_ctx_inc(x, y, 1 << size, chroma, scan_idx as u32, prev_csbf as u32) as u8;
+            pos += 1;
+        }
+        row += 1;
+    }
+    table
+};
+
+/// The [`SIG_CTX`] row for one subblock of a `1 << log2_trafo_size` block.
+fn sig_ctx_row(log2_trafo_size: u32, is_chroma: bool, scan_idx: u32, prev_csbf: u32, first_subblock: bool) -> Result<&'static [u8; 16]> {
+    let size = log2_trafo_size.wrapping_sub(2) as usize;
+    let row = (((size * 2 + is_chroma as usize) * 3 + scan_idx as usize) * 4 + prev_csbf as usize) * 2 + !first_subblock as usize;
+    if size > 3 || scan_idx > 2 || prev_csbf > 3 {
+        return Err(HeifError::MalformedHevc("significant_coeff_flag: context row out of range"));
+    }
+    SIG_CTX.get(row).ok_or(HeifError::MalformedHevc("significant_coeff_flag: context row out of range"))
 }
 
 fn decode_coeff_abs_level_remaining(engine: &mut Engine, rice_param: u32) -> Result<u32> {
@@ -221,15 +253,14 @@ pub fn decode_residual(
         // coefficient, so the AC loop below must start one position
         // *before* it, not re-decode it.
         let last_coeff_in_sb = if i == last_sb { last_scan_pos.saturating_sub(1) } else { 15 };
+        let sig_ctx_inc = sig_ctx_row(log2_trafo_size, is_chroma, scan_idx, prev_csbf, s.x + s.y == 0)?;
         if i == last_sb {
             push_sig(last_scan_pos)?;
         }
 
         for n in (1..=last_coeff_in_sb).rev() {
             let p = *pos_scan.get(n).ok_or(HeifError::MalformedHevc("residual: pos scan"))?;
-            let xc = (s.x << 2) + p.x;
-            let yc = (s.y << 2) + p.y;
-            let ctx_inc = sig_coeff_ctx_inc(xc, yc, sb_width, cidx, scan_idx, prev_csbf);
+            let ctx_inc = sig_ctx_inc[(p.y * 4 + p.x) as usize & 15];
             let model = ctxs.significant_coeff_flag.get_mut(ctx_inc as usize).ok_or(HeifError::MalformedHevc("significant_coeff_flag: context index"))?;
             if engine.decision(model)? == 1 {
                 push_sig(n)?;
@@ -244,9 +275,7 @@ pub fn decode_residual(
                 push_sig(0)?;
             } else {
                 let p0 = *pos_scan.first().ok_or(HeifError::MalformedHevc("residual: pos scan"))?;
-                let xc = (s.x << 2) + p0.x;
-                let yc = (s.y << 2) + p0.y;
-                let ctx_inc = sig_coeff_ctx_inc(xc, yc, sb_width, cidx, scan_idx, prev_csbf);
+                let ctx_inc = sig_ctx_inc[(p0.y * 4 + p0.x) as usize & 15];
                 let model = ctxs.significant_coeff_flag.get_mut(ctx_inc as usize).ok_or(HeifError::MalformedHevc("significant_coeff_flag: context index"))?;
                 if engine.decision(model)? == 1 {
                     push_sig(0)?;
@@ -377,6 +406,30 @@ mod tests {
     fn sig_ctx_dc_of_block_is_always_zero() {
         assert_eq!(sig_ctx(0, 0, 2, 0, 0, 0), 0);
         assert_eq!(sig_ctx(0, 0, 2, 1, 1, 3), 0);
+    }
+
+    #[test]
+    fn sig_ctx_table_matches_the_derivation() {
+        for log2 in 2..=5u32 {
+            let sb_width = 1u32 << (log2 - 2);
+            for cidx in 0..3usize {
+                for scan_idx in 0..3 {
+                    for prev_csbf in 0..4 {
+                        for (sx, sy) in (0..sb_width).flat_map(|sy| (0..sb_width).map(move |sx| (sx, sy))) {
+                            let row = sig_ctx_row(log2, cidx != 0, scan_idx, prev_csbf, sx + sy == 0).unwrap();
+                            for pos in 0..16u32 {
+                                let (x, y) = (sx * 4 + pos % 4, sy * 4 + pos / 4);
+                                assert_eq!(
+                                    u32::from(row[pos as usize]),
+                                    sig_coeff_ctx_inc(x, y, sb_width, cidx, scan_idx, prev_csbf),
+                                    "{log2} {cidx} {scan_idx} {prev_csbf} ({x},{y})"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]
