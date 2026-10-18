@@ -17,7 +17,7 @@ use super::params::{Pps, Sps};
 use super::residual::decode_residual;
 use super::scaling::ScalingListData;
 use super::slice::InterSlice;
-use super::transform::{chroma_qp_mapping, dequant_with_scale, inverse_transform, transform_skip_residual};
+use super::transform::{Dequant, chroma_qp_mapping, inverse_transform, transform_skip_residual};
 use crate::bitreader::BitReader;
 use crate::error::{HeifError, Result};
 
@@ -1225,12 +1225,18 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                         qp_c + qp_bd_offset_c
                     };
                     let dequantized = block(&mut scratch.dequantized, nt)?;
+                    let scale = Dequant::new(qp, bit_depth, log2_size)?;
                     for (i, (o, &c)) in dequantized.iter_mut().zip(coeffs.iter()).enumerate() {
+                        // A zero level dequantizes to zero, and most of a block is zeros.
+                        if c == 0 {
+                            *o = 0;
+                            continue;
+                        }
                         let weight = match self.scaling_list {
                             Some(list) => list.weight(log2_size, cidx, i % nt, i / nt)?,
                             None => 16,
                         };
-                        *o = dequant_with_scale(c, qp, bit_depth, log2_size, weight)?;
+                        *o = scale.apply(c, weight)?;
                     }
                     if transform_skip {
                         transform_skip_residual(dequantized, nt, bit_depth, res)?;

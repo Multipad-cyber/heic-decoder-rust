@@ -41,13 +41,35 @@ pub fn dequant(level: i32, qp: i32, bit_depth: u32, log2_size: u32) -> Result<i3
 /// Dequantization with the selected scaling-matrix coefficient (8.6.3).
 /// `qp` includes the component's bit-depth offset, i.e. Qp' rather than Qp.
 pub fn dequant_with_scale(level: i32, qp: i32, bit_depth: u32, log2_size: u32, weight: i32) -> Result<i32> {
-    if !(8..=16).contains(&bit_depth) || !(2..=5).contains(&log2_size) || !(0..=255).contains(&weight) || !(0..=51 + 6 * (bit_depth as i32 - 8)).contains(&qp) {
-        return Err(HeifError::MalformedHevc("dequant: parameter out of range"));
+    Dequant::new(qp, bit_depth, log2_size)?.apply(level, weight)
+}
+
+/// The dequantization (8.6.3) of one transform block, with its parameters
+/// checked once rather than per coefficient.
+#[derive(Debug, Clone, Copy)]
+pub struct Dequant {
+    fact: i64,
+    shift: u32,
+}
+
+impl Dequant {
+    /// `qp` includes the component's bit-depth offset, i.e. Qp' rather than Qp.
+    pub fn new(qp: i32, bit_depth: u32, log2_size: u32) -> Result<Self> {
+        if !(8..=16).contains(&bit_depth) || !(2..=5).contains(&log2_size) || !(0..=51 + 6 * (bit_depth as i32 - 8)).contains(&qp) {
+            return Err(HeifError::MalformedHevc("dequant: parameter out of range"));
+        }
+        Ok(Dequant { fact: LEVEL_SCALE[(qp % 6) as usize] << (qp / 6), shift: bit_depth + log2_size - 5 })
     }
-    let shift = bit_depth + log2_size - 5;
-    let fact = LEVEL_SCALE[(qp % 6) as usize] << (qp / 6);
-    let v = (i64::from(level) * i64::from(weight) * fact + (1i64 << (shift - 1))) >> shift;
-    Ok(v.clamp(-32768, 32767) as i32)
+
+    /// One coefficient, with the selected scaling-matrix entry `weight`.
+    #[inline]
+    pub fn apply(self, level: i32, weight: i32) -> Result<i32> {
+        if !(0..=255).contains(&weight) {
+            return Err(HeifError::MalformedHevc("dequant: parameter out of range"));
+        }
+        let v = (i64::from(level) * i64::from(weight) * self.fact + (1i64 << (self.shift - 1))) >> self.shift;
+        Ok(v.clamp(-32768, 32767) as i32)
+    }
 }
 
 /// Row 0 and column 0 of the 32-point DCT-II integer basis repeat across
@@ -240,6 +262,21 @@ mod tests {
         assert_eq!(dequant_with_scale(3, 0, 8, 3, 0).unwrap(), 0);
         // For 10-bit QpY=0, Qp'Y=12 compensates the extra two shift bits.
         assert_eq!(dequant_with_scale(3, 12, 10, 3, 17).unwrap(), 32);
+    }
+
+    #[test]
+    fn a_zero_level_dequantizes_to_zero() {
+        // What lets the block loop skip zeros: the rounding offset is below
+        // one step of the shift, for every parameter set.
+        for bit_depth in 8..=16 {
+            for log2_size in 2..=5 {
+                for qp in 0..=51 + 6 * (bit_depth as i32 - 8) {
+                    for weight in [0, 1, 16, 255] {
+                        assert_eq!(dequant_with_scale(0, qp, bit_depth, log2_size, weight).unwrap(), 0);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
