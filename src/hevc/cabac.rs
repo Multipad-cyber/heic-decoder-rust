@@ -11,6 +11,8 @@
 //! (`Table 9-4`) were checked the same way against `libde265`'s
 //! `contextmodel.cc`. See this crate's `README.md`.
 
+use std::marker::PhantomData;
+
 use crate::bitreader::BitReader;
 use crate::error::{HeifError, Result};
 
@@ -75,42 +77,102 @@ impl ContextModel {
     }
 }
 
-/// The CABAC arithmetic decoding engine (clause 9.3.4.3). Operates over a
-/// `BitReader` the caller owns (so slice-segment-data framing stays with
-/// the caller); this engine only ever reads single bits from it.
+/// The CABAC arithmetic decoding engine (clause 9.3.4.3), over the bytes
+/// of one slice segment substream. `range` and `offset` are the spec's
+/// 9-bit `ivlCurrRange`/`ivlOffset`; the bits not yet shifted into
+/// `offset` wait in a 64-bit cache refilled a byte at a time, so
+/// renormalization takes all the bits it needs in one shift.
+///
+/// Decoding a bin cannot fail, so it inlines into the syntax loops: past
+/// the end of the data the engine reads zeros and sets `overread`, which
+/// [`Engine::terminate`] (read after every CTU) reports as truncation.
+/// The `Result`s on the bin decoders stay so callers keep one error path.
 pub struct Engine<'a, 'b> {
-    bits: &'a mut BitReader<'b>,
+    data: &'b [u8],
+    /// Next byte of `data` to load into `cache`.
+    pos: usize,
+    /// Unread bits, most significant first: the next bit is bit 63.
+    cache: u64,
+    cache_bits: u32,
     range: u32,
     offset: u32,
+    /// A read went past the end of the data.
+    overread: bool,
+    /// The reader stays borrowed while the engine consumes its bytes.
+    _reader: PhantomData<&'a mut BitReader<'b>>,
 }
 
 impl<'a, 'b> Engine<'a, 'b> {
-    /// Clause 9.3.2.5: `ivlCurrRange = 510`, `ivlOffset = read_bits(9)`.
-    /// Bit position of the underlying reader, for diagnostics only (not
+    /// Bit position within the substream, for diagnostics only (not
     /// meaningful as "bits consumed by CABAC," since the engine buffers
     /// ahead of what it's resolved into bins).
     pub fn bit_pos(&self) -> usize {
-        self.bits.bit_pos()
+        self.pos * 8 - self.cache_bits as usize
     }
 
+    /// Clause 9.3.2.5: `ivlCurrRange = 510`, `ivlOffset = read_bits(9)`.
+    /// `bits` must be at a byte boundary, as slice data always is.
     pub fn new(bits: &'a mut BitReader<'b>) -> Result<Self> {
-        let offset = bits.bits(9)?;
-        Ok(Engine { bits, range: 510, offset })
+        let data = bits.rest().ok_or(HeifError::CabacDesync("engine: slice data not byte-aligned"))?;
+        let mut engine = Engine { data, pos: 0, cache: 0, cache_bits: 0, range: 510, offset: 0, overread: false, _reader: PhantomData };
+        engine.offset = engine.read(9);
+        engine.check_overread()?;
+        Ok(engine)
     }
 
-    fn renormalize(&mut self) -> Result<()> {
-        while self.range < 256 {
-            self.range <<= 1;
-            self.offset = (self.offset << 1) | self.bits.bit()?;
+    /// The next `n` bits (1..=32), MSB first; zeros past the end of the
+    /// data, which sets `overread`.
+    #[inline(always)]
+    fn read(&mut self, n: u32) -> u32 {
+        if self.cache_bits < n {
+            self.refill();
+            if self.cache_bits < n {
+                // The bits below the loaded ones are already zero.
+                self.overread = true;
+                self.cache_bits = n;
+            }
         }
-        Ok(())
+        let v = (self.cache >> (64 - n)) as u32;
+        self.cache <<= n;
+        self.cache_bits -= n;
+        v
     }
 
-    /// `DecodeDecision`, clause 9.3.4.3.2.
+    /// Reports a read past the end of the data as truncation.
+    fn check_overread(&self) -> Result<()> {
+        if self.overread { Err(HeifError::Truncated { at: self.data.len(), needed: 1 }) } else { Ok(()) }
+    }
+
+    #[inline(never)]
+    fn refill(&mut self) {
+        while self.cache_bits <= 56 {
+            let Some(&byte) = self.data.get(self.pos) else { break };
+            self.cache |= u64::from(byte) << (56 - self.cache_bits);
+            self.cache_bits += 8;
+            self.pos += 1;
+        }
+    }
+
+    /// Clause 9.3.4.3.3, all at once: shift `range` back up to 9 bits
+    /// (at most 7 places, since `range` never drops below 2) and as many
+    /// new bits into `offset`.
+    #[inline(always)]
+    fn renormalize(&mut self) {
+        let n = self.range.leading_zeros().saturating_sub(23);
+        if n > 0 {
+            self.range <<= n;
+            self.offset = (self.offset << n) | self.read(n);
+        }
+    }
+
+    /// `DecodeDecision`, clause 9.3.4.3.2. Never fails; see [`Engine`].
+    #[inline(always)]
     pub fn decision(&mut self, ctx: &mut ContextModel) -> Result<u32> {
-        let q_idx = ((self.range >> 6) - 4) as usize;
-        let lps_range =
-            *LPS_RANGE.get(ctx.state as usize).and_then(|row| row.get(q_idx)).ok_or(HeifError::CabacDesync("decision: context state out of range"))?;
+        // `state` is below 64 (every table entry is) and `range` is in
+        // 256..=510, so the masks never change an index; they only let the
+        // compiler drop the bounds checks.
+        let state = ctx.state as usize & 63;
+        let lps_range = LPS_RANGE[state][(self.range >> 6) as usize & 3];
         self.range -= lps_range;
 
         let bin_val;
@@ -118,27 +180,26 @@ impl<'a, 'b> Engine<'a, 'b> {
             bin_val = 1 - ctx.mps as u32;
             self.offset -= self.range;
             self.range = lps_range;
-            if ctx.state == 0 {
+            if state == 0 {
                 ctx.mps = 1 - ctx.mps;
             }
-            ctx.state = *NEXT_STATE_LPS.get(ctx.state as usize).ok_or(HeifError::CabacDesync("decision: LPS state out of range"))?;
+            ctx.state = NEXT_STATE_LPS[state];
         } else {
             bin_val = ctx.mps as u32;
-            ctx.state = *NEXT_STATE_MPS.get(ctx.state as usize).ok_or(HeifError::CabacDesync("decision: MPS state out of range"))?;
+            ctx.state = NEXT_STATE_MPS[state];
         }
-        self.renormalize()?;
+        self.renormalize();
         Ok(bin_val)
     }
 
-    /// `DecodeBypass`, clause 9.3.4.3.4.
+    /// `DecodeBypass`, clause 9.3.4.3.4. Never fails; see [`Engine`].
+    #[inline(always)]
     pub fn bypass(&mut self) -> Result<u32> {
-        self.offset = (self.offset << 1) | self.bits.bit()?;
-        let bin_val = if self.offset >= self.range {
-            self.offset -= self.range;
-            1
-        } else {
-            0
-        };
+        self.offset = (self.offset << 1) | self.read(1);
+        // Bypass bins are equiprobable, so a branch would mispredict half
+        // the time: subtract under a mask instead.
+        let bin_val = u32::from(self.offset >= self.range);
+        self.offset -= self.range & bin_val.wrapping_neg();
         Ok(bin_val)
     }
 
@@ -183,15 +244,18 @@ impl<'a, 'b> Engine<'a, 'b> {
         base.checked_add(suffix).ok_or(HeifError::MalformedHevc("egk_bypass: overflow"))
     }
 
-    /// `DecodeTerminate`, clause 9.3.4.3.5.
+    /// `DecodeTerminate`, clause 9.3.4.3.5. Also where a read past the end
+    /// of the data surfaces: this bin follows every CTU.
     pub fn terminate(&mut self) -> Result<u32> {
+        self.check_overread()?;
         self.range -= 2;
         let bin_val = if self.offset >= self.range {
             1
         } else {
-            self.renormalize()?;
+            self.renormalize();
             0
         };
+        self.check_overread()?;
         Ok(bin_val)
     }
 }

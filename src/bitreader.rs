@@ -108,6 +108,11 @@ impl<'a> BitReader<'a> {
         self.bit_pos
     }
 
+    /// The unread bytes, when the reader is at a byte boundary.
+    pub fn rest(&self) -> Option<&'a [u8]> {
+        if self.bit_pos.is_multiple_of(8) { self.data.get(self.bit_pos / 8..) } else { None }
+    }
+
     pub fn bits_remaining(&self) -> usize {
         self.data.len().saturating_mul(8).saturating_sub(self.bit_pos)
     }
