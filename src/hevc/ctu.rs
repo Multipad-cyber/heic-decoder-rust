@@ -55,6 +55,7 @@ impl Plane {
         self.samples.get(y * self.width + x).copied()
     }
 
+    #[cfg(test)]
     pub(crate) fn set_sample(&mut self, x: usize, y: usize, v: i32) -> Option<()> {
         if x >= self.width || y >= self.height {
             return None;

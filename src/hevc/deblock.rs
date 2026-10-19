@@ -39,29 +39,6 @@ fn clip3(lo: i32, hi: i32, v: i32) -> i32 {
     v.clamp(lo, hi)
 }
 
-/// Reads the 4 samples on one side of an edge (`p0..p3` for `side ==
-/// -1`, `q0..q3` for `side == 1`) at along-edge offset `k`. `None` if
-/// any of them falls outside the plane.
-fn read_side(plane: &Plane, x: i64, y: i64, vertical: bool, k: i64, side: i64) -> Option<[i32; 4]> {
-    let mut out = [0i32; 4];
-    for (i, o) in out.iter_mut().enumerate() {
-        let d = side * (i as i64 + 1) - if side < 0 { 0 } else { 1 }; // p: -1,-2,-3,-4; q: 0,1,2,3
-        let (sx, sy) = if vertical { (x + d, y + k) } else { (x + k, y + d) };
-        *o = plane.sample(usize::try_from(sx).ok()?, usize::try_from(sy).ok()?)?;
-    }
-    Some(out)
-}
-
-fn write_side(plane: &mut Plane, x: i64, y: i64, vertical: bool, k: i64, side: i64, vals: &[i32]) {
-    for (i, &v) in vals.iter().enumerate() {
-        let d = side * (i as i64 + 1) - if side < 0 { 0 } else { 1 };
-        let (sx, sy) = if vertical { (x + d, y + k) } else { (x + k, y + d) };
-        if let (Ok(sx), Ok(sy)) = (usize::try_from(sx), usize::try_from(sy)) {
-            plane.set_sample(sx, sy, v);
-        }
-    }
-}
-
 // Option::or selects the first present value, including Some(false).
 // CU and TU flags must instead be combined with boolean OR.
 fn is_filter_edge(pic: &Picture, x: i64, y: i64, vertical: bool) -> bool {
@@ -101,14 +78,58 @@ fn filter_luma_segment(pic: &mut Picture, x: usize, y: usize, vertical: bool, be
         return Ok(());
     }
 
-    let Some(p_0) = read_side(&pic.y, x, y, vertical, 0, -1) else { return Ok(()) };
-    let Some(q_0) = read_side(&pic.y, x, y, vertical, 0, 1) else { return Ok(()) };
-    let Some(p_3) = read_side(&pic.y, x, y, vertical, 3, -1) else { return Ok(()) };
-    let Some(q_3) = read_side(&pic.y, x, y, vertical, 3, 1) else { return Ok(()) };
-    let (p0_0, p1_0, p2_0) = (p_0[0], p_0[1], p_0[2]);
-    let (q0_0, q1_0, q2_0) = (q_0[0], q_0[1], q_0[2]);
-    let (p0_3, p1_3, p2_3) = (p_3[0], p_3[1], p_3[2]);
-    let (q0_3, q1_3, q2_3) = (q_3[0], q_3[1], q_3[2]);
+    let max_val = (1i32 << bit_depth) - 1;
+
+    // The segment is read once into lines across the edge, filtered there and
+    // written back; its rows do not affect each other. One reaching outside
+    // the plane is left as it is.
+    let w = pic.y.width;
+    let inside = if vertical {
+        x >= 4 && (x as usize) + 4 <= w && (y as usize) + 4 <= pic.y.height
+    } else {
+        y >= 4 && (y as usize) + 4 <= pic.y.height && (x as usize) + 4 <= w
+    };
+    if !inside {
+        return Ok(());
+    }
+    let (x, y) = (x as usize, y as usize);
+    // Sample `j` (p3..p0, q0..q3) of line `k`.
+    let index = |k: usize, j: usize| if vertical { (y + k) * w + x - 4 + j } else { (y + j - 4) * w + x + k };
+    let samples = pic.y.samples_mut();
+    let mut lines = [[0i32; 8]; 4];
+    for (k, line) in lines.iter_mut().enumerate() {
+        for (j, v) in line.iter_mut().enumerate() {
+            *v = samples[index(k, j)];
+        }
+    }
+    let Some(decision) = luma_decision(&lines[0], &lines[3], beta, tc) else { return Ok(()) };
+    for (k, line) in lines.iter_mut().enumerate() {
+        filter_luma_line(line, &decision, max_val);
+        let sides = [(!protect_p, 0..4), (!protect_q, 4..8)];
+        for j in sides.into_iter().filter(|(write, _)| *write).flat_map(|(_, js)| js) {
+            samples[index(k, j)] = line[j];
+        }
+    }
+    Ok(())
+}
+
+/// One line of samples across a luma edge: `p3 p2 p1 p0 q0 q1 q2 q3`.
+type Line = [i32; 8];
+
+/// The per-segment decisions of clause 8.7.2.5.3, made on lines 0 and 3.
+struct LumaDecision {
+    strong: bool,
+    d_ep: bool,
+    d_eq: bool,
+    tc: i32,
+}
+
+/// `None` when the segment is not filtered (`d >= beta`).
+fn luma_decision(line0: &Line, line3: &Line, beta: i32, tc: i32) -> Option<LumaDecision> {
+    let (p0_0, p1_0, p2_0) = (line0[3], line0[2], line0[1]);
+    let (q0_0, q1_0, q2_0) = (line0[4], line0[5], line0[6]);
+    let (p0_3, p1_3, p2_3) = (line3[3], line3[2], line3[1]);
+    let (q0_3, q1_3, q2_3) = (line3[4], line3[5], line3[6]);
 
     let dp0 = (p2_0 - 2 * p1_0 + p0_0).abs();
     let dp3 = (p2_3 - 2 * p1_3 + p0_3).abs();
@@ -120,70 +141,44 @@ fn filter_luma_segment(pic: &mut Picture, x: usize, y: usize, vertical: bool, be
     let dq = dq0 + dq3;
     let d = dpq0 + dpq3;
     if d >= beta {
-        return Ok(());
+        return None;
     }
 
-    let strong0 = 2 * dpq0 < (beta >> 2) && (p_0[3] - p0_0).abs() + (q0_0 - q_0[3]).abs() < (beta >> 3) && (p0_0 - q0_0).abs() < ((5 * tc + 1) >> 1);
-    let strong3 = 2 * dpq3 < (beta >> 2) && (p_3[3] - p0_3).abs() + (q0_3 - q_3[3]).abs() < (beta >> 3) && (p0_3 - q0_3).abs() < ((5 * tc + 1) >> 1);
-    let strong = strong0 && strong3;
-    let d_ep = dp < ((beta + (beta >> 1)) >> 3);
-    let d_eq = dq < ((beta + (beta >> 1)) >> 3);
-    let max_val = (1i32 << bit_depth) - 1;
+    let strong0 = 2 * dpq0 < (beta >> 2) && (line0[0] - p0_0).abs() + (q0_0 - line0[7]).abs() < (beta >> 3) && (p0_0 - q0_0).abs() < ((5 * tc + 1) >> 1);
+    let strong3 = 2 * dpq3 < (beta >> 2) && (line3[0] - p0_3).abs() + (q0_3 - line3[7]).abs() < (beta >> 3) && (p0_3 - q0_3).abs() < ((5 * tc + 1) >> 1);
+    Some(LumaDecision { strong: strong0 && strong3, d_ep: dp < ((beta + (beta >> 1)) >> 3), d_eq: dq < ((beta + (beta >> 1)) >> 3), tc })
+}
 
-    for k in 0..4i64 {
-        let Some(p) = read_side(&pic.y, x, y, vertical, k, -1) else { continue };
-        let Some(q) = read_side(&pic.y, x, y, vertical, k, 1) else { continue };
-        let (p0, p1, p2, p3) = (p[0], p[1], p[2], p[3]);
-        let (q0, q1, q2, q3) = (q[0], q[1], q[2], q[3]);
-        if strong {
-            let tc2 = 2 * tc;
-            let p0_f = clip3(p0 - tc2, p0 + tc2, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(0, max_val);
-            let p1_f = clip3(p1 - tc2, p1 + tc2, (p2 + p1 + p0 + q0 + 2) >> 2).clamp(0, max_val);
-            let p2_f = clip3(p2 - tc2, p2 + tc2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(0, max_val);
-            let q0_f = clip3(q0 - tc2, q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(0, max_val);
-            let q1_f = clip3(q1 - tc2, q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2).clamp(0, max_val);
-            let q2_f = clip3(q2 - tc2, q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(0, max_val);
-            if !protect_p {
-                write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f, p1_f, p2_f]);
-            }
-            if !protect_q {
-                write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f, q1_f, q2_f]);
-            }
-        } else {
-            let delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
-            if delta.abs() >= 10 * tc {
-                continue;
-            }
-            let delta = clip3(-tc, tc, delta);
-            let p0_f = (p0 + delta).clamp(0, max_val);
-            let q0_f = (q0 - delta).clamp(0, max_val);
-            let p1_f = if d_ep {
-                let delta_p = clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1);
-                Some((p1 + delta_p).clamp(0, max_val))
-            } else {
-                None
-            };
-            let q1_f = if d_eq {
-                let delta_q = clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1);
-                Some((q1 + delta_q).clamp(0, max_val))
-            } else {
-                None
-            };
-            if !protect_p {
-                match p1_f {
-                    Some(p1_f) => write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f, p1_f]),
-                    None => write_side(&mut pic.y, x, y, vertical, k, -1, &[p0_f]),
-                }
-            }
-            if !protect_q {
-                match q1_f {
-                    Some(q1_f) => write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f, q1_f]),
-                    None => write_side(&mut pic.y, x, y, vertical, k, 1, &[q0_f]),
-                }
-            }
-        }
+/// Filters one line (clause 8.7.2.5.7) in place; samples the filter does
+/// not modify keep their values.
+fn filter_luma_line(line: &mut Line, decision: &LumaDecision, max_val: i32) {
+    let [p3, p2, p1, p0, q0, q1, q2, q3] = *line;
+    let tc = decision.tc;
+    if decision.strong {
+        let tc2 = 2 * tc;
+        line[3] = clip3(p0 - tc2, p0 + tc2, (p2 + 2 * p1 + 2 * p0 + 2 * q0 + q1 + 4) >> 3).clamp(0, max_val);
+        line[2] = clip3(p1 - tc2, p1 + tc2, (p2 + p1 + p0 + q0 + 2) >> 2).clamp(0, max_val);
+        line[1] = clip3(p2 - tc2, p2 + tc2, (2 * p3 + 3 * p2 + p1 + p0 + q0 + 4) >> 3).clamp(0, max_val);
+        line[4] = clip3(q0 - tc2, q0 + tc2, (p1 + 2 * p0 + 2 * q0 + 2 * q1 + q2 + 4) >> 3).clamp(0, max_val);
+        line[5] = clip3(q1 - tc2, q1 + tc2, (p0 + q0 + q1 + q2 + 2) >> 2).clamp(0, max_val);
+        line[6] = clip3(q2 - tc2, q2 + tc2, (p0 + q0 + q1 + 3 * q2 + 2 * q3 + 4) >> 3).clamp(0, max_val);
+        return;
     }
-    Ok(())
+    let delta = (9 * (q0 - p0) - 3 * (q1 - p1) + 8) >> 4;
+    if delta.abs() >= 10 * tc {
+        return;
+    }
+    let delta = clip3(-tc, tc, delta);
+    line[3] = (p0 + delta).clamp(0, max_val);
+    line[4] = (q0 - delta).clamp(0, max_val);
+    if decision.d_ep {
+        let delta_p = clip3(-(tc >> 1), tc >> 1, (((p2 + p0 + 1) >> 1) - p1 + delta) >> 1);
+        line[2] = (p1 + delta_p).clamp(0, max_val);
+    }
+    if decision.d_eq {
+        let delta_q = clip3(-(tc >> 1), tc >> 1, (((q2 + q0 + 1) >> 1) - q1 - delta) >> 1);
+        line[5] = (q1 + delta_q).clamp(0, max_val);
+    }
 }
 
 /// Whether this luma position (the chroma edge's collocated luma
@@ -210,20 +205,22 @@ fn chroma_tc(pic: &Picture, lx: i64, ly: i64, vertical: bool, tc_offset: i32, qp
 /// one modified sample on each side, no strong/weak distinction.
 fn filter_chroma_pixels(plane: &mut Plane, cx: i64, cy: i64, vertical: bool, tc: i32, protect_p: bool, protect_q: bool) {
     let max_val = (1i32 << plane.bit_depth) - 1;
-    let (dxp0, dyp0, dxp1, dyp1, dxq0, dyq0, dxq1, dyq1) = if vertical { (-1, 0, -2, 0, 0, 0, 1, 0) } else { (0, -1, 0, -2, 0, 0, 0, 1) };
-    let read = |plane: &Plane, dx: i64, dy: i64| -> Option<i32> { plane.sample(usize::try_from(cx + dx).ok()?, usize::try_from(cy + dy).ok()?) };
-    let (Some(p0), Some(p1), Some(q0), Some(q1)) = (read(plane, dxp0, dyp0), read(plane, dxp1, dyp1), read(plane, dxq0, dyq0), read(plane, dxq1, dyq1)) else {
+    let (w, h) = (plane.width as i64, plane.height as i64);
+    let inside = if vertical { cx >= 2 && cx + 2 <= w && (0..h).contains(&cy) } else { cy >= 2 && cy + 2 <= h && (0..w).contains(&cx) };
+    // A pair whose four samples are not all in the plane is left as it is.
+    if !inside {
         return;
-    };
-
-    let delta = clip3(-tc, tc, (((q0 - p0) << 2) + p1 - q1 + 4) >> 3);
-    let p0_f = (p0 + delta).clamp(0, max_val);
-    let q0_f = (q0 - delta).clamp(0, max_val);
-    if !protect_p && let (Ok(x), Ok(y)) = (usize::try_from(cx + dxp0), usize::try_from(cy + dyp0)) {
-        plane.set_sample(x, y, p0_f);
     }
-    if !protect_q && let (Ok(x), Ok(y)) = (usize::try_from(cx + dxq0), usize::try_from(cy + dyq0)) {
-        plane.set_sample(x, y, q0_f);
+    // Samples p1 p0 q0 q1 across the edge.
+    let (center, step) = (cy as usize * plane.width + cx as usize, if vertical { 1 } else { plane.width });
+    let samples = plane.samples_mut();
+    let [p1, p0, q0, q1] = [center - 2 * step, center - step, center, center + step].map(|i| samples[i]);
+    let delta = clip3(-tc, tc, (((q0 - p0) << 2) + p1 - q1 + 4) >> 3);
+    if !protect_p {
+        samples[center - step] = (p0 + delta).clamp(0, max_val);
+    }
+    if !protect_q {
+        samples[center] = (q0 - delta).clamp(0, max_val);
     }
 }
 
