@@ -252,7 +252,35 @@ pub fn rbsp_len_to_ebsp_pos(ebsp: &[u8], target_rbsp_len: usize) -> Result<usize
 /// [`rbsp_len_to_ebsp_pos`]: converts an EBSP-space entry-point offset
 /// into an RBSP byte position.
 pub fn ebsp_len_to_rbsp_len(ebsp: &[u8], ebsp_len: usize) -> usize {
-    strip_emulation_prevention(ebsp.get(..ebsp_len.min(ebsp.len())).unwrap_or(ebsp)).len()
+    ebsp_lens_to_rbsp_lens(ebsp, &[ebsp_len])[0]
+}
+
+/// [`ebsp_len_to_rbsp_len`] for several prefix lengths in one pass over
+/// `ebsp`, rather than one pass, and one copy, per prefix: a slice's entry
+/// points come one per CTU row. Whether a byte is an emulation prevention
+/// byte depends only on the bytes before it, so a prefix's RBSP length is
+/// the count of kept bytes within it.
+pub fn ebsp_lens_to_rbsp_lens(ebsp: &[u8], ebsp_lens: &[usize]) -> Vec<usize> {
+    let mut lens = Vec::with_capacity(ebsp_lens.len());
+    let (mut position, mut kept, mut zero_run) = (0usize, 0usize, 0u32);
+    for &ebsp_len in ebsp_lens {
+        let end = ebsp_len.min(ebsp.len());
+        if end < position {
+            // Lengths that go back are counted again from the start.
+            (position, kept, zero_run) = (0, 0, 0);
+        }
+        for &b in &ebsp[position..end] {
+            if zero_run >= 2 && b == 0x03 {
+                zero_run = 0;
+                continue;
+            }
+            kept += 1;
+            zero_run = if b == 0 { zero_run + 1 } else { 0 };
+        }
+        position = end;
+        lens.push(kept);
+    }
+    lens
 }
 
 #[cfg(test)]
@@ -282,6 +310,24 @@ mod tests {
     fn truncated_ue_errs_not_panics() {
         let mut r = BitReader::new(&[0b0000_0000]);
         assert!(r.ue().is_err());
+    }
+
+    #[test]
+    fn one_pass_rbsp_lengths_match_stripping_each_prefix() {
+        // Bytes drawn mostly from 0x00 and 0x03, so emulation prevention
+        // sequences are dense, from a fixed linear congruential generator.
+        let mut state = 0x2545_f491u32;
+        let ebsp: Vec<u8> = (0..400)
+            .map(|_| {
+                state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+                [0x00, 0x00, 0x03, 0x01, 0x00, 0x03, 0xff][(state >> 16) as usize % 7]
+            })
+            .collect();
+        let expected = |len: usize| strip_emulation_prevention(&ebsp[..len.min(ebsp.len())]).len();
+        let rising: Vec<usize> = (0..=ebsp.len() + 2).collect();
+        assert_eq!(ebsp_lens_to_rbsp_lens(&ebsp, &rising), rising.iter().map(|&len| expected(len)).collect::<Vec<_>>());
+        let mixed = [7, 7, 300, 12, 0, 399, 400, 5000, 3];
+        assert_eq!(ebsp_lens_to_rbsp_lens(&ebsp, &mixed), mixed.iter().map(|&len| expected(len)).collect::<Vec<_>>());
     }
 
     #[test]

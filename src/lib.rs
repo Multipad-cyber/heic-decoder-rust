@@ -58,7 +58,7 @@ pub use isobmff::Metadata;
 /// requests return [`HeifError::LimitExceeded`] instead of allocating.
 pub const MAX_IMAGE_PIXELS: u64 = 1 << 28;
 
-use bitreader::{ebsp_len_to_rbsp_len, rbsp_len_to_ebsp_pos, strip_emulation_prevention};
+use bitreader::{ebsp_lens_to_rbsp_lens, rbsp_len_to_ebsp_pos, strip_emulation_prevention};
 use hevc::ctu::{Picture, decode_slice_rows};
 use hevc::deblock::deblock_picture;
 use hevc::nal::{NAL_PPS, NAL_SPS, is_irap_nal, parse_nal_header};
@@ -235,9 +235,15 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
         let mut substream_starts = Vec::with_capacity(slice_header.entry_point_offsets.len());
         if !slice_header.entry_point_offsets.is_empty() {
             let mut cumulative_ebsp = rbsp_len_to_ebsp_pos(payload, byte_pos)?;
-            for &delta in &slice_header.entry_point_offsets {
-                cumulative_ebsp = cumulative_ebsp.saturating_add(delta as usize);
-                let rbsp_pos_in_full = ebsp_len_to_rbsp_len(payload, cumulative_ebsp);
+            let ebsp_positions: Vec<usize> = slice_header
+                .entry_point_offsets
+                .iter()
+                .map(|&delta| {
+                    cumulative_ebsp = cumulative_ebsp.saturating_add(delta as usize);
+                    cumulative_ebsp
+                })
+                .collect();
+            for rbsp_pos_in_full in ebsp_lens_to_rbsp_lens(payload, &ebsp_positions) {
                 let rbsp_pos_in_slice_data =
                     rbsp_pos_in_full.checked_sub(byte_pos).ok_or(HeifError::MalformedHevc("decode: entry point before slice data start"))?;
                 substream_starts.push(rbsp_pos_in_slice_data);
