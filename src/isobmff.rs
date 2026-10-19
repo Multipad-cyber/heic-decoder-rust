@@ -426,6 +426,7 @@ pub fn split_length_prefixed_nalus(data: &[u8], length_size: usize) -> Result<Ve
 /// Parses a HEIF file, resolving the primary image item's HEVC
 /// configuration and coded sample bytes.
 pub fn parse(file: &[u8]) -> Result<ParsedHeif> {
+    let _timer = crate::timing::start(crate::timing::Stage::Container);
     parse_selected(file, None, true)
 }
 

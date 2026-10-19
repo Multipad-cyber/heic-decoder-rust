@@ -41,6 +41,12 @@ pub mod isobmff;
 #[cfg(not(feature = "internals"))]
 #[allow(dead_code)] // parsed fields and helpers used by `internals` users and tests
 mod isobmff;
+#[cfg(feature = "timing")]
+#[doc(hidden)]
+pub mod timing;
+#[cfg(not(feature = "timing"))]
+#[allow(dead_code)]
+mod timing;
 
 pub use color::{ChromaSampling, ChromaUpsampling, ColorInfo, RgbImage, RgbOptions, RgbaImage};
 pub use error::{HeifError, Result};
@@ -60,6 +66,7 @@ use hevc::params::{Pps, Sps, parse_pps, parse_sps};
 use hevc::sao::apply_sao;
 use hevc::slice::parse_slice_header;
 use isobmff::{ResolvedImage, split_length_prefixed_nalus};
+use timing::Stage;
 
 /// Native, full-range opacity: zero is transparent, `(1 << bit_depth) - 1`
 /// is opaque. Samples have the same dimensions and orientation as the image.
@@ -128,6 +135,7 @@ fn decode_one_image(image: &ResolvedImage) -> Result<(Sps, Picture)> {
 }
 
 fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> Result<(Sps, Picture)> {
+    let setup = timing::start(Stage::Headers);
     let sps: Sps = find_and_parse(image.hevc_config.nalus_of_type(NAL_SPS), NAL_SPS, parse_sps)?;
     let pps: Pps = find_and_parse(image.hevc_config.nalus_of_type(NAL_PPS), NAL_PPS, parse_pps)?;
 
@@ -182,6 +190,7 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
     if slices[0].0.slice_segment_address != 0 {
         return Err(HeifError::MalformedHevc("decode: missing first slice"));
     }
+    drop(setup);
     for (index, (slice_header, byte_pos, rbsp, payload)) in slices.iter().enumerate() {
         let byte_pos = *byte_pos;
         let address = slice_header.slice_segment_address;
@@ -235,6 +244,7 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
             }
         }
 
+        let timer = timing::start(Stage::SliceData);
         decode_slice_rows(
             &mut pic,
             slice_data,
@@ -251,8 +261,10 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
             address / columns,
             next / columns,
         )?;
+        drop(timer);
 
         if !slice_header.deblocking_filter_disabled {
+            let _timer = timing::start(Stage::Deblock);
             deblock_picture(
                 &mut pic,
                 &sps,
@@ -263,6 +275,7 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
             )?;
         }
         if slice_header.sao_luma || slice_header.sao_chroma {
+            let _timer = timing::start(Stage::Sao);
             apply_sao(&mut pic, &sps, slice_header.sao_luma, slice_header.sao_chroma)?;
         }
     }
@@ -270,6 +283,7 @@ fn decode_with_reference(image: &ResolvedImage, reference: Option<&Picture>) -> 
 }
 
 fn image_from_picture(sps: &Sps, pic: Picture) -> Result<DecodedImage> {
+    let _timer = timing::start(Stage::Pack);
     let cb_width = pic.cb.width;
     let cb_height = pic.cb.height;
     let image = DecodedImage {
@@ -497,6 +511,7 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<Decode
 
     // Every tile is held in memory until the canvas is assembled, so bound
     // their total size before decoding any of them.
+    let setup = timing::start(Stage::Headers);
     let mut tile_pixels = 0u64;
     for image in &parsed.images {
         let sps = find_and_parse(image.hevc_config.nalus_of_type(NAL_SPS), NAL_SPS, parse_sps)?;
@@ -505,6 +520,7 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<Decode
     if tile_pixels > MAX_IMAGE_PIXELS {
         return Err(HeifError::LimitExceeded("grid: tiles larger than MAX_IMAGE_PIXELS"));
     }
+    drop(setup);
 
     // Decode grid tiles in parallel using rayon
     use rayon::prelude::*;
@@ -516,6 +532,7 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<Decode
             image_from_picture(&sps, pic)
         })
         .collect::<Result<Vec<_>>>()?;
+    let assembly = timing::start(Stage::Grid);
     let first = tiles.first().ok_or(HeifError::MalformedBox("grid has no tiles"))?;
     let (tile_width, tile_height) = (first.width, first.height);
     let (bit_depth_luma, bit_depth_chroma, chroma_format_idc) = (first.bit_depth_luma, first.bit_depth_chroma, first.chroma_format_idc);
@@ -549,6 +566,7 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<Decode
     for (idx, tile) in tiles.iter().enumerate() {
         blit_tile(&mut canvas, tile, idx, grid.columns, tile_width, tile_height)?;
     }
+    drop(assembly);
     apply_transforms(canvas, transforms)
 }
 
@@ -725,6 +743,7 @@ fn apply_one_transform(img: DecodedImage, t: isobmff::Transform) -> Result<Decod
 }
 
 fn apply_transforms(mut img: DecodedImage, transforms: &[isobmff::Transform]) -> Result<DecodedImage> {
+    let _timer = timing::start(Stage::Transforms);
     let (mut sub_w, mut sub_h) = chroma_subsampling(img.chroma_format_idc);
     let mut window = ImageWindow { left: 0, top: 0, width: img.width, height: img.height };
     for &transform in transforms {

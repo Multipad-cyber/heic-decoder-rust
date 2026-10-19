@@ -20,6 +20,7 @@ use super::slice::InterSlice;
 use super::transform::{Dequant, chroma_qp_mapping, inverse_transform, transform_skip_residual};
 use crate::bitreader::BitReader;
 use crate::error::{HeifError, Result};
+use crate::timing::{self, Stage};
 
 pub struct Plane {
     pub width: usize,
@@ -1159,6 +1160,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
             let scratch = &mut *self.scratch;
             // Every prediction path below writes all nt*nt samples.
             let pred = block(&mut scratch.pred, nt)?;
+            let timer = timing::start(Stage::Intra);
             if self.current_intra {
                 let start_y = pic.slice_start_y / if cidx == 0 { 1 } else { self.sps.sub_height_c() as usize };
                 let mut border = Border::build(x0 as i64, y0 as i64, nt, bit_depth, |x, y| if y < start_y as i64 { None } else { plane.get(x, y) })?;
@@ -1177,6 +1179,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                     }
                 }
             }
+            drop(timer);
 
             if cbf {
                 // clause 7.3.8.8: `transform_skip_flag` is read right
@@ -1188,6 +1191,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 // encoder actually uses it on a 4x4 TU — this doesn't
                 // show up on any Apple-encoded real photo tested so far,
                 // only on non-Apple-encoded HEIF conformance files.
+                let timer = timing::start(Stage::Residual);
                 let transform_skip = if !self.transquant_bypass && self.pps.transform_skip_enabled && nt == 4 {
                     let ctx_idx = if cidx == 0 { 0 } else { 1 };
                     let model = self.ctxs.transform_skip_flag.get_mut(ctx_idx).ok_or(HeifError::MalformedHevc("transform_skip_flag: context index"))?;
@@ -1207,6 +1211,8 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                     self.pps.sign_data_hiding_enabled && !self.transquant_bypass,
                     coeffs,
                 )?;
+                drop(timer);
+                let timer = timing::start(Stage::Transform);
                 let res = block(&mut scratch.residual, nt)?;
                 if self.transquant_bypass {
                     res.copy_from_slice(coeffs);
@@ -1245,6 +1251,8 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                         inverse_transform(dequantized, nt, bit_depth, use_dst, res)?;
                     }
                 }
+                drop(timer);
+                let _timer = timing::start(Stage::Write);
                 for i in 0..nt * nt {
                     let p = *pred.get(i).ok_or(HeifError::MalformedHevc("reconstruct: pred index"))?;
                     let r = *res.get(i).ok_or(HeifError::MalformedHevc("reconstruct: res index"))?;
@@ -1252,6 +1260,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 }
             }
 
+            let _timer = timing::start(Stage::Write);
             let plane = match cidx {
                 0 => &mut pic.y,
                 1 => &mut pic.cb,

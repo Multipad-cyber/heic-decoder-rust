@@ -19,6 +19,9 @@ include = ["/src/**/*.rs", "/README.md", "/LICENSE-MIT", "/LICENSE-APACHE", "/Ca
 # the HM comparison tests and the reference_image example. Not covered by
 # semver; do not depend on it.
 internals = []
+# Stage timers for profiling, read with `heic_decoder::timing::take`. Not
+# covered by semver.
+timing = []
 
 [dependencies]
 thiserror = "2"

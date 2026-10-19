@@ -227,6 +227,7 @@ impl Matrix {
 }
 
 fn convert<T: RgbSample, const CHANNELS: usize>(image: &DecodedImage, options: &RgbOptions) -> Result<RgbImage<T>> {
+    let _timer = crate::timing::start(crate::timing::Stage::Color);
     let bad = || HeifError::MalformedHevc("RGB: invalid plane geometry or sampling");
     let monochrome = image.chroma_format_idc == 0;
     if image.width == 0 || image.height == 0 || (!monochrome && (image.cb_width == 0 || image.cb_height == 0)) {
