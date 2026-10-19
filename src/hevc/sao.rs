@@ -148,8 +148,11 @@ pub fn apply_sao(pic: &mut Picture, sps: &Sps, sao_luma: bool, sao_chroma: bool)
     let (pic_width_ctbs, pic_height_ctbs) = (pic.pic_width_ctbs(), pic.pic_height_ctbs());
     let sao = pic.sao_params().to_vec();
     let restore_bypass = pic.has_bypass();
+    // A component no CTB applies SAO to is left as it is, without the
+    // snapshot: encoders often signal SAO for the slice and then use it nowhere.
+    let used = |cidx: usize| sao.iter().any(|params| params.type_idx[cidx] != 0);
 
-    if sao_luma {
+    if sao_luma && used(0) {
         let (width, height) = (pic.y.width, pic.y.height);
         let snapshot = pic.y.samples().to_vec();
         apply_component(&sao, pic_width_ctbs, pic_height_ctbs, 0, width, height, ctb_pixel, ctb_pixel, pic.y.bit_depth, &snapshot, pic.y.samples_mut());
@@ -162,41 +165,45 @@ pub fn apply_sao(pic: &mut Picture, sps: &Sps, sao_luma: bool, sao_chroma: bool)
         let chroma_ctb_height = ctb_pixel / sps.sub_height_c() as usize;
 
         let (cb_width, cb_height) = (pic.cb.width, pic.cb.height);
-        let snapshot_cb = pic.cb.samples().to_vec();
-        apply_component(
-            &sao,
-            pic_width_ctbs,
-            pic_height_ctbs,
-            1,
-            cb_width,
-            cb_height,
-            chroma_ctb_width,
-            chroma_ctb_height,
-            pic.cb.bit_depth,
-            &snapshot_cb,
-            pic.cb.samples_mut(),
-        );
-        if restore_bypass {
-            pic.restore_bypass(1, &snapshot_cb, sps.sub_width_c() as usize, sps.sub_height_c() as usize);
+        if used(1) {
+            let snapshot_cb = pic.cb.samples().to_vec();
+            apply_component(
+                &sao,
+                pic_width_ctbs,
+                pic_height_ctbs,
+                1,
+                cb_width,
+                cb_height,
+                chroma_ctb_width,
+                chroma_ctb_height,
+                pic.cb.bit_depth,
+                &snapshot_cb,
+                pic.cb.samples_mut(),
+            );
+            if restore_bypass {
+                pic.restore_bypass(1, &snapshot_cb, sps.sub_width_c() as usize, sps.sub_height_c() as usize);
+            }
         }
 
         let (cr_width, cr_height) = (pic.cr.width, pic.cr.height);
-        let snapshot_cr = pic.cr.samples().to_vec();
-        apply_component(
-            &sao,
-            pic_width_ctbs,
-            pic_height_ctbs,
-            2,
-            cr_width,
-            cr_height,
-            chroma_ctb_width,
-            chroma_ctb_height,
-            pic.cr.bit_depth,
-            &snapshot_cr,
-            pic.cr.samples_mut(),
-        );
-        if restore_bypass {
-            pic.restore_bypass(2, &snapshot_cr, sps.sub_width_c() as usize, sps.sub_height_c() as usize);
+        if used(2) {
+            let snapshot_cr = pic.cr.samples().to_vec();
+            apply_component(
+                &sao,
+                pic_width_ctbs,
+                pic_height_ctbs,
+                2,
+                cr_width,
+                cr_height,
+                chroma_ctb_width,
+                chroma_ctb_height,
+                pic.cr.bit_depth,
+                &snapshot_cr,
+                pic.cr.samples_mut(),
+            );
+            if restore_bypass {
+                pic.restore_bypass(2, &snapshot_cr, sps.sub_width_c() as usize, sps.sub_height_c() as usize);
+            }
         }
     }
     Ok(())
