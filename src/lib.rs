@@ -329,39 +329,96 @@ fn image_from_picture(sps: &Sps, pic: Picture) -> Result<DecodedImage> {
 /// `output_width`/`output_height` says how much of the last tile is
 /// actually part of the picture). Chroma-subsampling-aware.
 #[allow(clippy::too_many_arguments)]
-fn blit_tile(canvas: &mut DecodedImage, tile: &DecodedImage, tile_idx: usize, columns: u32, tile_width: usize, tile_height: usize) -> Result<()> {
-    let tile_row = tile_idx / columns as usize;
-    let tile_col = tile_idx % columns as usize;
-    let dst_x = tile_col * tile_width;
-    let dst_y = tile_row * tile_height;
+/// Where one tile lands in one canvas plane: `width x height` samples from
+/// `source` (rows `source_width` apart) at `(x, y)`.
+struct Placement<'a> {
+    source: &'a [i32],
+    source_width: usize,
+    x: usize,
+    y: usize,
+    width: usize,
+    height: usize,
+}
 
-    let copy_w = tile.width.min(canvas.width.saturating_sub(dst_x));
-    let copy_h = tile.height.min(canvas.height.saturating_sub(dst_y));
-    for row in 0..copy_h {
-        let src_row_start = row * tile.width;
-        let dst_row_start = (dst_y + row) * canvas.width + dst_x;
-        let src = tile.y.get(src_row_start..src_row_start + copy_w).ok_or(HeifError::MalformedHevc("blit_tile: luma source row out of range"))?;
-        let dst = canvas.y.get_mut(dst_row_start..dst_row_start + copy_w).ok_or(HeifError::MalformedHevc("blit_tile: luma dest row out of range"))?;
-        dst.copy_from_slice(src);
+impl Placement<'_> {
+    /// The source and canvas ranges of row `row`.
+    fn rows(&self, row: usize, canvas_width: usize) -> (std::ops::Range<usize>, std::ops::Range<usize>) {
+        let source = row * self.source_width;
+        let canvas = (self.y + row) * canvas_width + self.x;
+        (source..source + self.width, canvas..canvas + self.width)
     }
+}
 
-    if canvas.chroma_format_idc == 0 {
-        return Ok(());
-    }
+/// Copies every tile into the canvas. Each tile covers `tile_width x
+/// tile_height` at its grid position, cropped to the canvas.
+fn blit_tiles(canvas: &mut DecodedImage, tiles: &[DecodedImage], columns: u32, tile_width: usize, tile_height: usize) -> Result<()> {
     let (sub_w, sub_h) = chroma_subsampling(canvas.chroma_format_idc);
-    let c_copy_w = copy_w.div_ceil(sub_w);
-    let c_copy_h = copy_h.div_ceil(sub_h);
-    let c_dst_x = dst_x / sub_w;
-    let c_dst_y = dst_y / sub_h;
-    for row in 0..c_copy_h {
-        let src_row_start = row * tile.cb_width;
-        let dst_row_start = (c_dst_y + row) * canvas.cb_width + c_dst_x;
-        for (plane_src, plane_dst) in [(&tile.cb, &mut canvas.cb), (&tile.cr, &mut canvas.cr)] {
-            let src = plane_src.get(src_row_start..src_row_start + c_copy_w).ok_or(HeifError::MalformedHevc("blit_tile: chroma source row out of range"))?;
-            let dst = plane_dst.get_mut(dst_row_start..dst_row_start + c_copy_w).ok_or(HeifError::MalformedHevc("blit_tile: chroma dest row out of range"))?;
-            dst.copy_from_slice(src);
+    let mut luma = Vec::with_capacity(tiles.len());
+    let mut chroma = Vec::with_capacity(tiles.len());
+    for (idx, tile) in tiles.iter().enumerate() {
+        let x = idx % columns as usize * tile_width;
+        let y = idx / columns as usize * tile_height;
+        let width = tile.width.min(canvas.width.saturating_sub(x));
+        let height = tile.height.min(canvas.height.saturating_sub(y));
+        luma.push(Placement { source: &tile.y, source_width: tile.width, x, y, width, height });
+        if canvas.chroma_format_idc != 0 {
+            let place = |source| Placement {
+                source,
+                source_width: tile.cb_width,
+                x: x / sub_w,
+                y: y / sub_h,
+                width: width.div_ceil(sub_w),
+                height: height.div_ceil(sub_h),
+            };
+            chroma.push((place(&tile.cb), place(&tile.cr)));
         }
     }
+
+    // Every row is checked first, tile by tile, luma before chroma, so a bad
+    // tile fails as it would copying one tile at a time.
+    for (idx, place) in luma.iter().enumerate() {
+        for row in 0..place.height {
+            let (source, target) = place.rows(row, canvas.width);
+            if source.end > place.source.len() {
+                return Err(HeifError::MalformedHevc("blit_tile: luma source row out of range"));
+            }
+            if target.end > canvas.y.len() {
+                return Err(HeifError::MalformedHevc("blit_tile: luma dest row out of range"));
+            }
+        }
+        for place in chroma.get(idx).into_iter().flat_map(|(cb, cr)| [cb, cr]) {
+            for row in 0..place.height {
+                let (source, target) = place.rows(row, canvas.cb_width);
+                if source.end > place.source.len() {
+                    return Err(HeifError::MalformedHevc("blit_tile: chroma source row out of range"));
+                }
+                if target.end > canvas.cb.len() {
+                    return Err(HeifError::MalformedHevc("blit_tile: chroma dest row out of range"));
+                }
+            }
+        }
+    }
+
+    // Canvas rows are filled in parallel. A row takes its tiles in order, so
+    // where tiles overlap the later one wins, as copying tile by tile.
+    fn fill(plane: &mut [i32], width: usize, places: &[&Placement]) {
+        use rayon::prelude::*;
+        if width == 0 {
+            return;
+        }
+        plane.par_chunks_mut(width).with_min_len(16).enumerate().for_each(|(y, row)| {
+            for place in places.iter().filter(|place| (place.y..place.y + place.height).contains(&y)) {
+                let (source, target) = place.rows(y - place.y, width);
+                let target = target.start - y * width..target.end - y * width;
+                if let (Some(source), Some(target)) = (place.source.get(source), row.get_mut(target)) {
+                    target.copy_from_slice(source);
+                }
+            }
+        });
+    }
+    fill(&mut canvas.y, canvas.width, &luma.iter().collect::<Vec<_>>());
+    fill(&mut canvas.cb, canvas.cb_width, &chroma.iter().map(|(cb, _)| cb).collect::<Vec<_>>());
+    fill(&mut canvas.cr, canvas.cb_width, &chroma.iter().map(|(_, cr)| cr).collect::<Vec<_>>());
     Ok(())
 }
 
@@ -563,9 +620,7 @@ fn decode_pixels(parsed: &isobmff::ParsedHeif, transform: bool) -> Result<Decode
         cb_height,
         metadata: isobmff::Metadata::default(),
     };
-    for (idx, tile) in tiles.iter().enumerate() {
-        blit_tile(&mut canvas, tile, idx, grid.columns, tile_width, tile_height)?;
-    }
+    blit_tiles(&mut canvas, &tiles, grid.columns, tile_width, tile_height)?;
     drop(assembly);
     apply_transforms(canvas, transforms)
 }
@@ -779,6 +834,108 @@ fn apply_transforms(mut img: DecodedImage, transforms: &[isobmff::Transform]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Grid assembly as it was before rows were filled in parallel: one
+    /// tile at a time, in order.
+    fn blit_tile_by_tile(canvas: &mut DecodedImage, tiles: &[DecodedImage], columns: u32, tile_width: usize, tile_height: usize) -> Result<()> {
+        for (idx, tile) in tiles.iter().enumerate() {
+            let dst_x = idx % columns as usize * tile_width;
+            let dst_y = idx / columns as usize * tile_height;
+            let copy_w = tile.width.min(canvas.width.saturating_sub(dst_x));
+            let copy_h = tile.height.min(canvas.height.saturating_sub(dst_y));
+            for row in 0..copy_h {
+                let (s, d) = (row * tile.width, (dst_y + row) * canvas.width + dst_x);
+                let src = tile.y.get(s..s + copy_w).ok_or(HeifError::MalformedHevc("blit_tile: luma source row out of range"))?;
+                let dst = canvas.y.get_mut(d..d + copy_w).ok_or(HeifError::MalformedHevc("blit_tile: luma dest row out of range"))?;
+                dst.copy_from_slice(src);
+            }
+            if canvas.chroma_format_idc == 0 {
+                continue;
+            }
+            let (sub_w, sub_h) = chroma_subsampling(canvas.chroma_format_idc);
+            let (c_copy_w, c_copy_h) = (copy_w.div_ceil(sub_w), copy_h.div_ceil(sub_h));
+            for row in 0..c_copy_h {
+                let (s, d) = (row * tile.cb_width, (dst_y / sub_h + row) * canvas.cb_width + dst_x / sub_w);
+                for (src, dst) in [(&tile.cb, &mut canvas.cb), (&tile.cr, &mut canvas.cr)] {
+                    let src = src.get(s..s + c_copy_w).ok_or(HeifError::MalformedHevc("blit_tile: chroma source row out of range"))?;
+                    let dst = dst.get_mut(d..d + c_copy_w).ok_or(HeifError::MalformedHevc("blit_tile: chroma dest row out of range"))?;
+                    dst.copy_from_slice(src);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn grid_rows_filled_in_parallel_match_tile_by_tile_assembly() {
+        let image = |width: usize, height: usize, format: u32, seed: i32| {
+            let (sub_w, sub_h) = chroma_subsampling(format);
+            let (cb_width, cb_height) = if format == 0 { (0, 0) } else { (width.div_ceil(sub_w), height.div_ceil(sub_h)) };
+            let plane = |n: usize, k: i32| (0..n as i32).map(|i| (i * 7 + seed * 31 + k) % 256).collect::<Vec<_>>();
+            DecodedImage {
+                alpha: None,
+                width,
+                height,
+                bit_depth_luma: 8,
+                bit_depth_chroma: 8,
+                chroma_format_idc: format,
+                color_info: None,
+                chroma_sampling: ChromaSampling::coded(format, None),
+                y: plane(width * height, 0),
+                cb: plane(cb_width * cb_height, 1),
+                cr: plane(cb_width * cb_height, 2),
+                cb_width,
+                cb_height,
+                metadata: isobmff::Metadata::default(),
+            }
+        };
+        for format in 0..=3 {
+            // Canvas size, grid columns, cell size, and each tile's size: tiles
+            // that overhang their cell (and overlap the next), fall short of
+            // it, or are cropped by the canvas edge.
+            type Case = (usize, usize, u32, usize, usize, &'static [(usize, usize)]);
+            let cases: [Case; 4] = [
+                (40, 24, 2, 20, 12, &[(20, 12); 4]),
+                (36, 20, 2, 20, 12, &[(20, 12); 4]),
+                (40, 24, 2, 20, 12, &[(24, 16), (20, 12), (16, 8), (24, 14)]),
+                (40, 30, 3, 16, 16, &[(16, 16); 6]),
+            ];
+            for (width, height, columns, tile_width, tile_height, sizes) in cases {
+                let tiles = || sizes.iter().enumerate().map(|(i, &(w, h))| image(w, h, format, i as i32)).collect::<Vec<_>>();
+                let canvas = || {
+                    let mut canvas = image(width, height, format, 0);
+                    for plane in [&mut canvas.y, &mut canvas.cb, &mut canvas.cr] {
+                        plane.fill(0);
+                    }
+                    canvas
+                };
+                let (mut expected, mut actual) = (canvas(), canvas());
+                blit_tile_by_tile(&mut expected, &tiles(), columns, tile_width, tile_height).unwrap();
+                blit_tiles(&mut actual, &tiles(), columns, tile_width, tile_height).unwrap();
+                assert!(
+                    (actual.y == expected.y) && (actual.cb == expected.cb) && (actual.cr == expected.cr),
+                    "format {format}, canvas {width}x{height}, tiles {sizes:?}"
+                );
+
+                // A tile whose planes are too short fails with the same error.
+                for plane in 0..3 {
+                    let mut short = tiles();
+                    let tile = &mut short[2];
+                    let target = match plane {
+                        0 => &mut tile.y,
+                        1 => &mut tile.cb,
+                        _ => &mut tile.cr,
+                    };
+                    if target.is_empty() {
+                        continue;
+                    }
+                    target.truncate(target.len() / 2);
+                    let want = blit_tile_by_tile(&mut canvas(), &short, columns, tile_width, tile_height).unwrap_err().to_string();
+                    assert_eq!(blit_tiles(&mut canvas(), &short, columns, tile_width, tile_height).unwrap_err().to_string(), want);
+                }
+            }
+        }
+    }
 
     #[test]
     fn rotated_422_crop_retains_vertical_chroma_subsampling() {
