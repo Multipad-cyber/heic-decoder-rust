@@ -135,7 +135,8 @@ impl RgbSample for u8 {
         ((u64::from(sample) * 255 + u64::from(max / 2)) / u64::from(max)) as u8
     }
     fn quantize(value: f32) -> Self {
-        (value * 255.0).round().clamp(0.0, 255.0) as u8
+        // `as` saturates: below zero and NaN become 0, above 255 becomes 255.
+        (value * 255.0).round() as u8
     }
 }
 impl RgbSample for u16 {
@@ -143,7 +144,7 @@ impl RgbSample for u16 {
         ((u64::from(sample) * 65535 + u64::from(max / 2)) / u64::from(max)) as u16
     }
     fn quantize(value: f32) -> Self {
-        (value * 65535.0).round().clamp(0.0, 65535.0) as u16
+        (value * 65535.0).round() as u16
     }
 }
 
@@ -199,9 +200,17 @@ impl Matrix {
         } else {
             (16.0 * y_shift, 1.0 / (219.0 * y_shift), 128.0 * c_shift, 1.0 / (224.0 * c_shift))
         };
+        let identity = info.matrix_coefficients == 0;
+        // Identity coding stores G, B, R in the nominal Y, Cb, Cr planes, so
+        // Cb and Cr are scaled like luma, at their own depth.
+        let (c_offset, c_scale) = match (identity, info.full_range) {
+            (false, _) => (c_offset, c_scale),
+            (true, true) => (0.0, 1.0 / ((1u32 << c_depth) - 1) as f32),
+            (true, false) => (16.0 * c_shift, 1.0 / (219.0 * c_shift)),
+        };
         let kg = 1.0 - kr - kb;
         Ok(Self {
-            identity: info.matrix_coefficients == 0,
+            identity,
             y_offset,
             y_scale,
             c_offset,
@@ -212,19 +221,87 @@ impl Matrix {
             green_cr: -2.0 * kr * (1.0 - kr) / kg,
         })
     }
-    fn rgb(&self, y: f32, cb: f32, cr: f32, c_depth: u32, full_range: bool) -> [f32; 3] {
-        let y = (y - self.y_offset) * self.y_scale;
+    /// Converts one row from luma and chroma at full width. The identity
+    /// test sits outside the loops so that each one vectorizes.
+    fn row<T: RgbSample, const CHANNELS: usize>(&self, pixels: &mut [[T; CHANNELS]], luma: &[i32], cb: &[f32], cr: &[f32]) {
         if self.identity {
-            // Identity coding stores G, B, R in the nominal Y, Cb, Cr planes.
-            let shift = (1u32 << (c_depth - 8)) as f32;
-            let (offset, scale) = if full_range { (0.0, 1.0 / ((1u32 << c_depth) - 1) as f32) } else { (16.0 * shift, 1.0 / (219.0 * shift)) };
-            return [(cr - offset) * scale, y, (cb - offset) * scale];
+            for (((rgb, &y), &cb), &cr) in pixels.iter_mut().zip(luma).zip(cb).zip(cr) {
+                rgb[0] = T::quantize((cr - self.c_offset) * self.c_scale);
+                rgb[1] = T::quantize((y as f32 - self.y_offset) * self.y_scale);
+                rgb[2] = T::quantize((cb - self.c_offset) * self.c_scale);
+            }
+        } else {
+            for (((rgb, &y), &cb), &cr) in pixels.iter_mut().zip(luma).zip(cb).zip(cr) {
+                let y = (y as f32 - self.y_offset) * self.y_scale;
+                let cb = (cb - self.c_offset) * self.c_scale;
+                let cr = (cr - self.c_offset) * self.c_scale;
+                rgb[0] = T::quantize(y + self.red_cr * cr);
+                rgb[1] = T::quantize(y + self.green_cb * cb + self.green_cr * cr);
+                rgb[2] = T::quantize(y + self.blue_cb * cb);
+            }
         }
-        let cb = (cb - self.c_offset) * self.c_scale;
-        let cr = (cr - self.c_offset) * self.c_scale;
-        [y + self.red_cr * cr, y + self.green_cb * cb + self.green_cr * cr, y + self.blue_cb * cb]
     }
 }
+
+/// Chroma rows interpolated horizontally to the output width, Cb and Cr,
+/// keyed by chroma row. Each output row blends two of them, and neighbouring
+/// output rows share theirs, so a band of rows interpolates each chroma row
+/// once rather than once for every output row that reads it.
+struct ChromaRows {
+    keys: [Option<usize>; 3],
+    cb: Vec<f32>,
+    cr: Vec<f32>,
+    /// One output row's chroma, blended from two of the rows above.
+    blended: [Vec<f32>; 2],
+}
+impl ChromaRows {
+    fn new(width: usize) -> Self {
+        ChromaRows { keys: [None; 3], cb: vec![0.0; 3 * width], cr: vec![0.0; 3 * width], blended: [vec![0.0; width], vec![0.0; width]] }
+    }
+    /// The slot holding chroma row `row`, interpolating it into a slot other
+    /// than `keep`'s if no slot holds it yet. `None` if a sample of the row
+    /// exceeds `max`.
+    fn slot(&mut self, row: usize, keep: usize, image: &DecodedImage, xs: &[Axis], max: u32) -> Option<usize> {
+        if let Some(slot) = self.keys.iter().position(|&key| key == Some(row)) {
+            return Some(slot);
+        }
+        let slot =
+            (0..3).filter(|&slot| self.keys[slot] != Some(keep)).max_by_key(|&slot| self.keys[slot].map_or(usize::MAX, |key| key.abs_diff(row))).unwrap_or(0);
+        let width = xs.len();
+        for (plane, rows) in [(&image.cb, &mut self.cb), (&image.cr, &mut self.cr)] {
+            let source = &plane[row * image.cb_width..][..image.cb_width];
+            if !in_range(source, max) {
+                return None;
+            }
+            for (o, ax) in rows[slot * width..][..width].iter_mut().zip(xs) {
+                *o = source[ax.lo] as f32 * (1.0 - ax.weight) + source[ax.hi] as f32 * ax.weight;
+            }
+        }
+        self.keys[slot] = Some(row);
+        Some(slot)
+    }
+    /// Blends the rows in slots `top` and `bottom`: `top * (1 - weight) + bottom * weight`.
+    fn blend(&mut self, top: usize, bottom: usize, weight: f32) -> (&[f32], &[f32]) {
+        let width = self.blended[0].len();
+        let [cb, cr] = &mut self.blended;
+        for (rows, out) in [(&self.cb, &mut *cb), (&self.cr, &mut *cr)] {
+            let (t, b) = (&rows[top * width..][..width], &rows[bottom * width..][..width]);
+            for ((o, &t), &b) in out.iter_mut().zip(t).zip(b) {
+                *o = t * (1.0 - weight) + b * weight;
+            }
+        }
+        (cb, cr)
+    }
+}
+
+/// Whether every sample lies in `0..=max`; written as a maximum, without an
+/// early exit, so that it vectorizes.
+fn in_range(samples: &[i32], max: u32) -> bool {
+    samples.iter().map(|&v| v as u32).max().is_none_or(|v| v <= max)
+}
+
+/// Output rows per parallel task; a band reuses its interpolated chroma rows.
+const ROWS_PER_BAND: usize = 16;
 
 fn convert<T: RgbSample, const CHANNELS: usize>(image: &DecodedImage, options: &RgbOptions) -> Result<RgbImage<T>> {
     let _timer = crate::timing::start(crate::timing::Stage::Color);
@@ -267,12 +344,6 @@ fn convert<T: RgbSample, const CHANNELS: usize>(image: &DecodedImage, options: &
     {
         return Err(bad());
     }
-    for (plane, depth) in [(&image.y, image.bit_depth_luma), (&image.cb, image.bit_depth_chroma), (&image.cr, image.bit_depth_chroma)] {
-        let max = (1i32 << depth) - 1;
-        if plane.par_chunks(1 << 16).any(|chunk| chunk.iter().any(|&v| !(0..=max).contains(&v))) {
-            return Err(HeifError::MalformedHevc("RGB: sample outside coded range"));
-        }
-    }
     let info = options.color.or(image.color_info).unwrap_or_default();
     let matrix = Matrix::new(if monochrome { ColorInfo { matrix_coefficients: 1, ..info } } else { info }, image.bit_depth_luma, image.bit_depth_chroma)?;
     if matrix.identity && (s.sub_x != 1 || s.sub_y != 1) {
@@ -284,52 +355,64 @@ fn convert<T: RgbSample, const CHANNELS: usize>(image: &DecodedImage, options: &
     let mut data = Vec::new();
     data.try_reserve_exact(length).map_err(|_| HeifError::LimitExceeded("RGB: output allocation failed"))?;
     data.resize(length, T::default());
-    let (width, cb_width) = (image.width, image.cb_width);
+    // Samples are range-checked as the rows are read: luma row by row, and
+    // each chroma row as it is interpolated. A chroma row no output row reads
+    // is checked here.
+    let out_of_range = || HeifError::MalformedHevc("RGB: sample outside coded range");
+    let (luma_max, chroma_max) = ((1u32 << image.bit_depth_luma) - 1, (1u32 << image.bit_depth_chroma) - 1);
+    let mut read = vec![false; if monochrome { 0 } else { image.cb_height }];
+    for ay in &ys {
+        read[ay.lo] = true;
+        read[ay.hi] = true;
+    }
+    for (row, _) in read.iter().enumerate().filter(|(_, read)| !**read) {
+        for plane in [&image.cb, &image.cr] {
+            if !in_range(&plane[row * image.cb_width..][..image.cb_width], chroma_max) {
+                return Err(out_of_range());
+            }
+        }
+    }
+    let width = image.width;
     let row_length = width * CHANNELS;
-    // Each row first interpolates the two chroma planes into row buffers, then
-    // converts and quantizes; the arithmetic, and its order, is the same as
-    // interpolating pixel by pixel, so the output is too. Alpha comes last.
-    data.par_chunks_mut(row_length).enumerate().for_each_init(
-        || (vec![0f32; if monochrome { 0 } else { width }], vec![0f32; if monochrome { 0 } else { width }]),
-        |(cb_row, cr_row), (row, output)| {
-            let pixels = output.as_chunks_mut::<CHANNELS>().0;
-            let luma = &image.y[row * width..][..width];
-            if monochrome {
-                for (rgb, &y) in pixels.iter_mut().zip(luma) {
-                    let value = T::quantize((y as f32 - matrix.y_offset) * matrix.y_scale);
-                    rgb[..3].fill(value);
+    // The arithmetic, and its order, is the same as interpolating chroma
+    // pixel by pixel, so the output is too. Alpha comes last.
+    data.par_chunks_mut(row_length * ROWS_PER_BAND).enumerate().try_for_each_init(
+        || ChromaRows::new(if monochrome { 0 } else { width }),
+        |chroma, (band, rows)| {
+            for (i, output) in rows.chunks_mut(row_length).enumerate() {
+                let row = band * ROWS_PER_BAND + i;
+                let pixels = output.as_chunks_mut::<CHANNELS>().0;
+                let luma = &image.y[row * width..][..width];
+                if !in_range(luma, luma_max) {
+                    return Err(out_of_range());
                 }
-            } else {
-                let ay = &ys[row];
-                for (plane, out) in [(&image.cb, &mut *cb_row), (&image.cr, &mut *cr_row)] {
-                    let top = &plane[ay.lo * cb_width..][..cb_width];
-                    let bottom = &plane[ay.hi * cb_width..][..cb_width];
-                    for (o, ax) in out.iter_mut().zip(&xs) {
-                        let t = top[ax.lo] as f32 * (1.0 - ax.weight) + top[ax.hi] as f32 * ax.weight;
-                        let b = bottom[ax.lo] as f32 * (1.0 - ax.weight) + bottom[ax.hi] as f32 * ax.weight;
-                        *o = t * (1.0 - ay.weight) + b * ay.weight;
+                if monochrome {
+                    for (rgb, &y) in pixels.iter_mut().zip(luma) {
+                        let value = T::quantize((y as f32 - matrix.y_offset) * matrix.y_scale);
+                        rgb[..3].fill(value);
                     }
+                } else {
+                    let ay = &ys[row];
+                    let top = chroma.slot(ay.lo, ay.hi, image, &xs, chroma_max).ok_or_else(out_of_range)?;
+                    let bottom = chroma.slot(ay.hi, ay.lo, image, &xs, chroma_max).ok_or_else(out_of_range)?;
+                    let (cb, cr) = chroma.blend(top, bottom, ay.weight);
+                    matrix.row(pixels, luma, cb, cr);
                 }
-                for (((rgb, &y), &cb), &cr) in pixels.iter_mut().zip(luma).zip(cb_row.iter()).zip(cr_row.iter()) {
-                    let values = matrix.rgb(y as f32, cb, cr, image.bit_depth_chroma, info.full_range);
-                    for (channel, value) in rgb.iter_mut().zip(values) {
-                        *channel = T::quantize(value);
-                    }
-                }
-            }
-            if CHANNELS == 4 {
-                match &image.alpha {
-                    Some(alpha) => {
-                        let max = (1u32 << alpha.bit_depth) - 1;
-                        for (rgb, &a) in pixels.iter_mut().zip(&alpha.samples[row * width..][..width]) {
-                            rgb[3] = T::alpha(a as u32, max);
+                if CHANNELS == 4 {
+                    match &image.alpha {
+                        Some(alpha) => {
+                            let max = (1u32 << alpha.bit_depth) - 1;
+                            for (rgb, &a) in pixels.iter_mut().zip(&alpha.samples[row * width..][..width]) {
+                                rgb[3] = T::alpha(a as u32, max);
+                            }
                         }
+                        None => pixels.iter_mut().for_each(|rgb| rgb[3] = T::alpha(1, 1)),
                     }
-                    None => pixels.iter_mut().for_each(|rgb| rgb[3] = T::alpha(1, 1)),
                 }
             }
+            Ok(())
         },
-    );
+    )?;
     Ok(RgbImage { width: image.width, height: image.height, data })
 }
 
@@ -555,5 +638,26 @@ mod tests {
         image.chroma_sampling = ChromaSampling::coded(2, None);
         image.color_info = Some(info(0, true));
         assert!(image.to_rgb8().is_err());
+    }
+    #[test]
+    fn a_chroma_row_no_pixel_reads_is_still_range_checked() {
+        // With the chroma origin two rows up and nearest sampling, every
+        // output row reads chroma row 1, none reads row 0.
+        let image = |cb0: i32| DecodedImage {
+            width: 2,
+            height: 4,
+            cb_width: 1,
+            cb_height: 2,
+            chroma_format_idc: 1,
+            chroma_sampling: ChromaSampling { sub_x: 2, sub_y: 2, origin_x: 0.0, origin_y: -2.0 },
+            y: vec![100; 8],
+            cb: vec![cb0, 128],
+            cr: vec![128; 2],
+            ..planar(vec![100], vec![128], vec![128], 8, info(1, false))
+        };
+        let nearest = RgbOptions { upsampling: ChromaUpsampling::Nearest, ..Default::default() };
+        assert!(image(255).to_rgb8_with_options(&nearest).is_ok());
+        assert!(image(256).to_rgb8_with_options(&nearest).is_err());
+        assert!(image(-1).to_rgb8_with_options(&nearest).is_err());
     }
 }

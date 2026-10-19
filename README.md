@@ -72,6 +72,8 @@ Bilinear chroma reconstruction is the default. `image.to_rgb8_with_options(&RgbO
 
 RGB output retains the source primaries and transfer function. Apply the source ICC profile or appropriate color management when displaying it; this conversion does not assume sRGB, linearise pixels or tone-map HDR. The PPM example does not embed ICC metadata.
 
+The conversion computes in floats. heic-rs uses integer arithmetic, which is faster, but switching to it would change this crate's output.
+
 ## Transparency
 
 `image.alpha` contains full-range native opacity samples and its own bit depth.
