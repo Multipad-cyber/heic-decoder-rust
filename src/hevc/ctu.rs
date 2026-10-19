@@ -81,6 +81,21 @@ impl Plane {
         Ok(())
     }
 
+    /// Writes an `n x n` block, row-major in `block`, at `(x0, y0)` and marks
+    /// it decoded.
+    fn write_block(&mut self, x0: usize, y0: usize, n: usize, block: &[i32]) -> Result<()> {
+        let out_of_bounds = || HeifError::MalformedHevc("plane write out of bounds");
+        if x0 + n > self.width || y0 + n > self.height || block.len() < n * n {
+            return Err(out_of_bounds());
+        }
+        for (row, source) in block.chunks_exact(n).enumerate() {
+            let start = (y0 + row) * self.width + x0;
+            self.samples.get_mut(start..start + n).ok_or_else(out_of_bounds)?.copy_from_slice(source);
+            self.decoded.get_mut(start..start + n).ok_or_else(out_of_bounds)?.fill(true);
+        }
+        Ok(())
+    }
+
     pub fn into_samples(self) -> Vec<i32> {
         self.samples
     }
@@ -1253,10 +1268,9 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 }
                 drop(timer);
                 let _timer = timing::start(Stage::Write);
-                for i in 0..nt * nt {
-                    let p = *pred.get(i).ok_or(HeifError::MalformedHevc("reconstruct: pred index"))?;
-                    let r = *res.get(i).ok_or(HeifError::MalformedHevc("reconstruct: res index"))?;
-                    *pred.get_mut(i).ok_or(HeifError::MalformedHevc("reconstruct: pred index"))? = (p + r).clamp(0, (1i32 << bit_depth) - 1);
+                let max = (1i32 << bit_depth) - 1;
+                for (p, &r) in pred.iter_mut().zip(res.iter()) {
+                    *p = (*p + r).clamp(0, max);
                 }
             }
 
@@ -1266,12 +1280,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 1 => &mut pic.cb,
                 _ => &mut pic.cr,
             };
-            for y in 0..nt {
-                for x in 0..nt {
-                    let v = *pred.get(x + y * nt).ok_or(HeifError::MalformedHevc("reconstruct: write index"))?;
-                    plane.set(x0 + x, y0 + y, v)?;
-                }
-            }
+            plane.write_block(x0, y0, nt, pred)?;
         }
         Ok(())
     }
