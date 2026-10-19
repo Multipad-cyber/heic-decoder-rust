@@ -135,8 +135,12 @@ impl RgbSample for u8 {
         ((u64::from(sample) * 255 + u64::from(max / 2)) / u64::from(max)) as u8
     }
     fn quantize(value: f32) -> Self {
-        // `as` saturates: below zero and NaN become 0, above 255 becomes 255.
-        (value * 255.0).round() as u8
+        if HAS_ROUND {
+            // `as` saturates: below zero and NaN become 0, above 255 becomes 255.
+            (value * 255.0).round() as u8
+        } else {
+            quantize_without_round(value, 255.0, 255) as u8
+        }
     }
 }
 impl RgbSample for u16 {
@@ -144,8 +148,28 @@ impl RgbSample for u16 {
         ((u64::from(sample) * 65535 + u64::from(max / 2)) / u64::from(max)) as u16
     }
     fn quantize(value: f32) -> Self {
-        (value * 65535.0).round() as u16
+        if HAS_ROUND { (value * 65535.0).round() as u16 } else { quantize_without_round(value, 65535.0, 65535) as u16 }
     }
+}
+
+/// Whether `f32::round` is an instruction here. Baseline x86-64 (SSE2) has
+/// none, so `round` is a `roundf` call per channel and the loop does not
+/// vectorize; there [`quantize_without_round`] is used instead.
+const HAS_ROUND: bool = cfg!(any(target_arch = "aarch64", target_feature = "sse4.1"));
+
+/// `value * scale` rounded half away from zero and clamped to `0..=max`,
+/// NaN to 0: the same as `(value * scale).round() as u8` (or `u16`) for every
+/// `f32`, all of which were compared, on ARM and on x86-64. Neither `round`
+/// nor a float-to-integer cast vectorizes with SSE2 only. Instead, adding 2^23
+/// rounds the clamped value to an integer (ties to even), which the sum's
+/// mantissa then holds; a tie rounded down is moved up.
+#[inline(always)]
+fn quantize_without_round(value: f32, scale: f32, max: u32) -> u32 {
+    const TWO_23: f32 = 8_388_608.0;
+    let clamped = (value * scale).max(0.0).min(max as f32);
+    let shifted = clamped + TWO_23;
+    let nearest = shifted.to_bits() - TWO_23.to_bits();
+    nearest + u32::from(clamped - (shifted - TWO_23) == 0.5)
 }
 
 struct Axis {
@@ -638,6 +662,40 @@ mod tests {
         image.chroma_sampling = ChromaSampling::coded(2, None);
         image.color_info = Some(info(0, true));
         assert!(image.to_rgb8().is_err());
+    }
+    #[test]
+    fn quantize_matches_rounding_at_the_edges() {
+        // Every f32 was compared once; these are the cases that could differ.
+        let below_half = f32::from_bits(0.5f32.to_bits() - 1);
+        for value in [
+            0.0,
+            -0.0,
+            0.5,
+            below_half,
+            1.5,
+            2.5,
+            254.5,
+            255.0,
+            255.49998,
+            255.5,
+            -0.5,
+            -0.49999997,
+            1e10,
+            -1e10,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MAX,
+            f32::MIN_POSITIVE,
+            16_777_217.0,
+            2_147_483_648.0,
+        ] {
+            for scale in [1.0f32, 1.0 / 255.0, 1.0 / 65535.0] {
+                let v = value * scale;
+                assert_eq!(quantize_without_round(v, 255.0, 255), u32::from((v * 255.0).round() as u8), "{value} * {scale} to u8");
+                assert_eq!(quantize_without_round(v, 65535.0, 65535), u32::from((v * 65535.0).round() as u16), "{value} * {scale} to u16");
+            }
+        }
     }
     #[test]
     fn a_chroma_row_no_pixel_reads_is_still_range_checked() {
