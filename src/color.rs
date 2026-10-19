@@ -267,7 +267,8 @@ fn convert<T: RgbSample, const CHANNELS: usize>(image: &DecodedImage, options: &
         return Err(bad());
     }
     for (plane, depth) in [(&image.y, image.bit_depth_luma), (&image.cb, image.bit_depth_chroma), (&image.cr, image.bit_depth_chroma)] {
-        if plane.iter().any(|&v| v < 0 || v as u32 >= 1u32 << depth) {
+        let max = (1i32 << depth) - 1;
+        if plane.par_chunks(1 << 16).any(|chunk| chunk.iter().any(|&v| !(0..=max).contains(&v))) {
             return Err(HeifError::MalformedHevc("RGB: sample outside coded range"));
         }
     }
@@ -282,32 +283,52 @@ fn convert<T: RgbSample, const CHANNELS: usize>(image: &DecodedImage, options: &
     let mut data = Vec::new();
     data.try_reserve_exact(length).map_err(|_| HeifError::LimitExceeded("RGB: output allocation failed"))?;
     data.resize(length, T::default());
-    let row_length = image.width * CHANNELS;
-    data.par_chunks_mut(row_length).enumerate().for_each(|(row, output)| {
-        for (x, rgb) in output.chunks_mut(CHANNELS).enumerate() {
-            let values = if monochrome {
-                [(image.y[row * image.width + x] as f32 - matrix.y_offset) * matrix.y_scale; 3]
+    let (width, cb_width) = (image.width, image.cb_width);
+    let row_length = width * CHANNELS;
+    // Each row first interpolates the two chroma planes into row buffers, then
+    // converts and quantizes; the arithmetic, and its order, is the same as
+    // interpolating pixel by pixel, so the output is too. Alpha comes last.
+    data.par_chunks_mut(row_length).enumerate().for_each_init(
+        || (vec![0f32; if monochrome { 0 } else { width }], vec![0f32; if monochrome { 0 } else { width }]),
+        |(cb_row, cr_row), (row, output)| {
+            let pixels = output.as_chunks_mut::<CHANNELS>().0;
+            let luma = &image.y[row * width..][..width];
+            if monochrome {
+                for (rgb, &y) in pixels.iter_mut().zip(luma) {
+                    let value = T::quantize((y as f32 - matrix.y_offset) * matrix.y_scale);
+                    rgb[..3].fill(value);
+                }
             } else {
                 let ay = &ys[row];
-                let ax = &xs[x];
-                let interpolate = |plane: &[i32]| {
-                    let top = plane[ay.lo * image.cb_width + ax.lo] as f32 * (1.0 - ax.weight) + plane[ay.lo * image.cb_width + ax.hi] as f32 * ax.weight;
-                    let bottom = plane[ay.hi * image.cb_width + ax.lo] as f32 * (1.0 - ax.weight) + plane[ay.hi * image.cb_width + ax.hi] as f32 * ax.weight;
-                    top * (1.0 - ay.weight) + bottom * ay.weight
-                };
-                matrix.rgb(image.y[row * image.width + x] as f32, interpolate(&image.cb), interpolate(&image.cr), image.bit_depth_chroma, info.full_range)
-            };
-            for (channel, value) in rgb.iter_mut().zip(values) {
-                *channel = T::quantize(value);
+                for (plane, out) in [(&image.cb, &mut *cb_row), (&image.cr, &mut *cr_row)] {
+                    let top = &plane[ay.lo * cb_width..][..cb_width];
+                    let bottom = &plane[ay.hi * cb_width..][..cb_width];
+                    for (o, ax) in out.iter_mut().zip(&xs) {
+                        let t = top[ax.lo] as f32 * (1.0 - ax.weight) + top[ax.hi] as f32 * ax.weight;
+                        let b = bottom[ax.lo] as f32 * (1.0 - ax.weight) + bottom[ax.hi] as f32 * ax.weight;
+                        *o = t * (1.0 - ay.weight) + b * ay.weight;
+                    }
+                }
+                for (((rgb, &y), &cb), &cr) in pixels.iter_mut().zip(luma).zip(cb_row.iter()).zip(cr_row.iter()) {
+                    let values = matrix.rgb(y as f32, cb, cr, image.bit_depth_chroma, info.full_range);
+                    for (channel, value) in rgb.iter_mut().zip(values) {
+                        *channel = T::quantize(value);
+                    }
+                }
             }
             if CHANNELS == 4 {
-                rgb[3] = match &image.alpha {
-                    Some(alpha) => T::alpha(alpha.samples[row * image.width + x] as u32, (1u32 << alpha.bit_depth) - 1),
-                    None => T::alpha(1, 1),
-                };
+                match &image.alpha {
+                    Some(alpha) => {
+                        let max = (1u32 << alpha.bit_depth) - 1;
+                        for (rgb, &a) in pixels.iter_mut().zip(&alpha.samples[row * width..][..width]) {
+                            rgb[3] = T::alpha(a as u32, max);
+                        }
+                    }
+                    None => pixels.iter_mut().for_each(|rgb| rgb[3] = T::alpha(1, 1)),
+                }
             }
-        }
-    });
+        },
+    );
     Ok(RgbImage { width: image.width, height: image.height, data })
 }
 
