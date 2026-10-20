@@ -101,19 +101,21 @@ tile matches HM.
 - Advanced Range Extensions tools such as RDPCM, persistent Rice adaptation, transform-skip rotation, disabled intra smoothing and cross-component prediction; streams that enable them return an `Unsupported` error
 - Auxiliary depth maps and HDR gain maps; alpha attached separately to individual colour-grid tiles; resizing alpha to a different display resolution
 
-## Comparison with other Rust decoders
+## Comparison with heic-rs
 
-| | heic-decoder | [heic-rs](https://github.com/tbraun96/heic-rs) 0.1.1 | [imazen/heic](https://github.com/imazen/heic) |
-|---|---|---|---|
-| Nokia conformance files decoded | **62 / 63** | 44 / 63 | 61 / 63 |
-| Raw YCbCr output on 788 coded images¹ | **bit-exact** | **bit-exact** | ±1–2 errors in 114 images |
-| iPhone photo, 12 MP grid | 392 ms | **291 ms** | 1271 ms |
-| HEIC sample photo, 12 MP grid | 345 ms | **202 ms** | 771 ms |
-| 44 conformance files all three decode | 2.65 s | **1.90 s** | 2.47 s |
+| | heic-decoder 0.1.1 | [heic-rs](https://github.com/tbraun96/heic-rs) 0.1.4 |
+|---|---|---|
+| Nokia conformance files decoded | **62 / 63** | 43 / 63 |
+| Decoded YCbCr¹ | **matches HM** | matches on 54 Nokia images; differs on 4:2:2 |
+| RGB output | **correctly rounded** | up to 2.6 levels off; colours wrong when only the HEVC stream labels them ([details](#accuracy-compared-with-heic-rs)) |
+| 12 MP grid photos (3), all cores | 75.5 ms | **53.5 ms** |
+| 12 MP grid photos (3), one thread | 319 ms | **264 ms** |
+| 43 Nokia files both decode, all cores | 41.2 ms | **41.1 ms** |
+| 43 Nokia files both decode, one thread | 49.0 ms | **48.0 ms** |
 
-¹ Every grid tile and single image from the conformance suite and 15 real photos, each decoded by all three from the identical bitstream and compared sample by sample before colour conversion. heic-decoder and heic-rs agree on all 784 images both decode. On the 114 images where imazen/heic differs (1,055 samples, mostly luma), [HM](https://vcgit.hhi.fraunhofer.de/jvet/HM), the official HEVC reference decoder, matches heic-decoder and heic-rs exactly.
+¹ Sample by sample before colour conversion, from the identical bitstream. heic-rs's samples match heic-decoder's on every primary image in the Nokia suite it decodes. On this crate's 4:2:2 fixtures they differ, while heic-decoder's match HM, the [official HEVC reference decoder](https://vcgit.hhi.fraunhofer.de/jvet/HM).
 
-Timings: median of repeated runs, release builds, Apple M4 (5 cores). These measurements use the planar `decode` API and exclude optional RGB conversion. heic-rs and imazen/heic were asked for RGB output, so heic-decoder does slightly less work in this comparison.
+Timings measure the whole decode to RGB through the same wrapper for both decoders: PhotoCraft's HEIF crate, which probes, decodes and converts to RGB: 8-bit for 8-bit sources and 16-bit for deeper ones, with an alpha channel when the image has one. Each figure is the mean time per file, using each file's best of 3 interleaved rounds, where every round is the median of 5 decodes. The machine is an Apple M4 (4 performance and 6 efficiency cores, macOS 26.7) running release builds with thin LTO. The 12 MP files are 4032×3024 grid HEICs written by macOS `sips`. For one of them, heic-rs's faster result has the wrong colours (see below).
 
 ## Accuracy compared with heic-rs
 
