@@ -72,7 +72,7 @@ Bilinear chroma reconstruction is the default. `image.to_rgb8_with_options(&RgbO
 
 RGB output retains the source primaries and transfer function. Apply the source ICC profile or appropriate color management when displaying it; this conversion does not assume sRGB, linearise pixels or tone-map HDR. The PPM example does not embed ICC metadata.
 
-The conversion computes in floats. heic-rs uses integer arithmetic, which is faster, but switching to it would change this crate's output.
+The conversion computes in floats. Every RGB8 value is the correctly rounded result, and every RGB16 value is within 0.51 of exact. heic-rs uses integer arithmetic instead; [Accuracy compared with heic-rs](#accuracy-compared-with-heic-rs) shows what that costs.
 
 ## Transparency
 
@@ -114,6 +114,36 @@ tile matches HM.
 ¹ Every grid tile and single image from the conformance suite and 15 real photos, each decoded by all three from the identical bitstream and compared sample by sample before colour conversion. heic-decoder and heic-rs agree on all 784 images both decode. On the 114 images where imazen/heic differs (1,055 samples, mostly luma), [HM](https://vcgit.hhi.fraunhofer.de/jvet/HM), the official HEVC reference decoder, matches heic-decoder and heic-rs exactly.
 
 Timings: median of repeated runs, release builds, Apple M4 (5 cores). These measurements use the planar `decode` API and exclude optional RGB conversion. heic-rs and imazen/heic were asked for RGB output, so heic-decoder does slightly less work in this comparison.
+
+## Accuracy compared with heic-rs
+
+heic-rs is faster, and much of that speed is paid for in accuracy. Both decoders converted the same decoded samples, and every channel was compared against an exact float64 conversion that uses the same chroma siting. The test set was 70 files: Nokia conformance files, 12 MP photos and this crate's fixtures, with heic-rs at version 0.1.4.
+
+| Output | Decoder | correctly rounded | 1 level off | 2 levels off | 3+ off | worst error |
+|---|---|---|---|---|---|---|
+| RGB8 | **heic-decoder** | **99.9999 %**¹ | 0.0001 % | 0 | 0 | **0.50** |
+| RGB8 | heic-rs | 88.27 % | 11.29 % | 0.44 % | 0.005 % | 2.6 |
+| RGB16 | **heic-decoder** | **99.85 %** | 0.15 % | 0 | 0 | **0.51** |
+| RGB16 | heic-rs | 72.44 % | 0.10 % | 0.03 % | 27.43 % | 543 |
+
+¹ The remaining values are exact rounding ties.
+
+- **Rounding.**
+  - heic-rs rounds the interpolated chroma to whole input steps, twice, before applying a fixed-point matrix.
+  - As a result, one RGB8 value in nine is wrong, some by two levels.
+  - Its RGB16 output is wrong in more than a quarter of all values, by up to 543. That is about two 8-bit levels, so asking heic-rs for 16 bits gains little over 8.
+- **Colour information.**
+  - heic-rs reads the matrix and range only from a `colr/nclx` box. It ignores the colour information in the HEVC stream's VUI.
+  - A file that signals its colour only there, for example one with an ICC `colr` box instead of nclx, is converted as BT.709 limited range whatever it actually is.
+  - One example is a 12 MP HEIC written by macOS `sips`, whose stream declares BT.601 full range. heic-rs shifts its colours by up to 31 levels across 82 % of the image.
+  - A 10-bit test file from pillow-heif is off by up to 35 levels.
+- **4:2:2.**
+  - 4:2:2 is the format Sony and Canon cameras write.
+  - On this crate's 4:2:2 fixtures, the chroma samples heic-rs 0.1.4 decodes differ from HM's: 378 samples in a single 64×64 picture.
+  - In RGB, that becomes errors of up to 48 levels.
+- **Streams heic-rs cannot open.** Eight of this crate's fixtures fail in heic-rs with an error: 10- and 12-bit, 4:4:4, lossless and multi-slice streams.
+
+heic-decoder matches HM on all of these files, and its RGB output is the correctly rounded value.
 
 ## Testing
 
