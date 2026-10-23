@@ -31,6 +31,7 @@ pub mod bitreader;
 mod bitreader;
 mod color;
 mod error;
+// Decoding straight to RGB, without assembling the planar picture.
 #[cfg(feature = "internals")]
 pub mod hevc;
 #[cfg(not(feature = "internals"))]
@@ -41,6 +42,7 @@ pub mod isobmff;
 #[cfg(not(feature = "internals"))]
 #[allow(dead_code)] // parsed fields and helpers used by `internals` users and tests
 mod isobmff;
+mod rgb;
 #[cfg(feature = "timing")]
 #[doc(hidden)]
 pub mod timing;
@@ -51,6 +53,7 @@ mod timing;
 pub use color::{ChromaSampling, ChromaUpsampling, ColorInfo, RgbImage, RgbOptions, RgbaImage};
 pub use error::{HeifError, Result};
 pub use isobmff::Metadata;
+pub use rgb::{AlphaMode, DecodeRgbOptions, decode_rgb8, decode_rgb8_with};
 
 /// Largest picture, in luma samples, that the decoder will allocate
 /// (2^28, about 268 megapixels). Applies to each coded image, to the
