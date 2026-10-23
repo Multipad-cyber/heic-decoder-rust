@@ -66,7 +66,7 @@ cargo run --release --example decode_rgb -- photo.heic out.ppm 16
 
 Call `image.to_rgb8()` or `image.to_rgb16()` after decoding. RGB16 preserves high-bit-depth samples without an intermediate 8-bit conversion. The returned `RgbImage` contains tightly packed, row-major RGB triples.
 
-The converter uses container `colr/nclx` information first, then SPS VUI, then an explicit BT.709 limited-range fallback for unlabelled images. It supports BT.601, BT.709, BT.2020 non-constant luminance, FCC, SMPTE 240M and identity/GBR matrices. Other matrix codes return an unsupported error during RGB conversion; planar decoding remains available. Primaries and transfer codes are exposed in `image.color_info`; ICC remains in `image.metadata.icc_profile`.
+The converter uses container `colr/nclx` information first, then SPS VUI, then BT.601 limited range for unlabelled images (or a matrix labelled unspecified), as libheif does and as MIAF specifies. It supports BT.601, BT.709, BT.2020 non-constant luminance, FCC, SMPTE 240M and identity/GBR matrices. Other matrix codes return an unsupported error during RGB conversion; planar decoding remains available. Primaries and transfer codes are exposed in `image.color_info`; ICC remains in `image.metadata.icc_profile`.
 
 Bilinear chroma reconstruction is the default. `image.to_rgb8_with_options(&RgbOptions { color: Some(color_info), upsampling: ChromaUpsampling::Nearest })` can override matrix/range or select nearest-neighbour reconstruction; RGB16 has the same options. Chroma sample positions from SPS VUI are tracked through cropping, mirroring and rotation. Samples outside the returned native planes are edge-extended.
 
