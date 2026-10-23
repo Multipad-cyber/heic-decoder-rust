@@ -63,6 +63,41 @@ impl ScalingListData {
     }
 }
 
+/// Every scaling matrix expanded to its transform size once per slice, so
+/// dequantization reads one entry per coefficient instead of resolving
+/// size, matrix, replication and DC each time. `[sizeId][matrixId]` holds `nT * nT` weights in raster
+/// order, each already checked to be a valid weight.
+pub struct ScalingWeights {
+    tables: [[Vec<i32>; 6]; 4],
+}
+
+impl ScalingWeights {
+    pub fn new(list: &ScalingListData) -> Result<Self> {
+        let mut tables: [[Vec<i32>; 6]; 4] = Default::default();
+        for (size, row) in tables.iter_mut().enumerate() {
+            let log2_size = size as u32 + 2;
+            let nt = 1usize << log2_size;
+            for (matrix, table) in row.iter_mut().enumerate() {
+                table.reserve_exact(nt * nt);
+                for i in 0..nt * nt {
+                    let weight = list.weight(log2_size, matrix, i % nt, i / nt)?;
+                    if !(0..=255).contains(&weight) {
+                        return Err(HeifError::MalformedHevc("dequant: parameter out of range"));
+                    }
+                    table.push(weight);
+                }
+            }
+        }
+        Ok(ScalingWeights { tables })
+    }
+
+    /// The `nT * nT` weights of a `1 << log2_size` transform for `matrix`.
+    pub fn table(&self, log2_size: u32, matrix: usize) -> Result<&[i32]> {
+        let size = log2_size.wrapping_sub(2) as usize;
+        self.tables.get(size).and_then(|row| row.get(matrix)).map(Vec::as_slice).ok_or(HeifError::MalformedHevc("scaling list: invalid size or matrix"))
+    }
+}
+
 pub(crate) fn parse_scaling_list_data(r: &mut BitReader<'_>) -> Result<ScalingListData> {
     let mut lists = ScalingListData::default();
     for size in 0..4 {
