@@ -417,7 +417,11 @@ pub fn split_length_prefixed_nalus(data: &[u8], length_size: usize) -> Result<Ve
         pos += length_size;
         let len = usize::try_from(len).map_err(|_| HeifError::MalformedHevc("NAL length overflow"))?;
         let nal = data.get(pos..pos + len).ok_or(HeifError::Truncated { at: pos, needed: len })?;
-        out.push(nal.to_vec());
+        // Some writers pad an item with zero-length NAL units (Nokia's
+        // C034 ends in one). libheif and FFmpeg skip them.
+        if !nal.is_empty() {
+            out.push(nal.to_vec());
+        }
         pos += len;
     }
     Ok(out)
@@ -1237,6 +1241,12 @@ mod tests {
     fn rejects_non_heif_input() {
         let err = parse(b"not a heif file at all, just plain bytes").unwrap_err();
         assert!(matches!(err, HeifError::NotHeif(_)));
+    }
+
+    #[test]
+    fn zero_length_nal_units_are_skipped() {
+        let data = [&2u32.to_be_bytes()[..], &[0x26, 0x01], &0u32.to_be_bytes(), &1u32.to_be_bytes(), &[0x42], &0u32.to_be_bytes()].concat();
+        assert_eq!(split_length_prefixed_nalus(&data, 4).unwrap(), vec![vec![0x26, 0x01], vec![0x42]]);
     }
 
     #[test]
