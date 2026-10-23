@@ -150,12 +150,10 @@ fn sig_ctx_row(log2_trafo_size: u32, is_chroma: bool, scan_idx: u32, prev_csbf: 
 
 fn decode_coeff_abs_level_remaining(engine: &mut Engine, rice_param: u32) -> Result<u32> {
     const MAX_PREFIX: u32 = 15 + 3;
-    let mut prefix = 0u32;
-    while engine.bypass()? == 1 {
-        prefix += 1;
-        if prefix > MAX_PREFIX {
-            return Ok(0);
-        }
+    // As the bin-by-bin loop did: past MAX_PREFIX ones, stop and give 0.
+    let prefix = engine.bypass_unary(MAX_PREFIX + 1)?;
+    if prefix > MAX_PREFIX {
+        return Ok(0);
     }
     if prefix <= 3 {
         let codeword = engine.bypass_fl(rice_param)?;
@@ -165,6 +163,13 @@ fn decode_coeff_abs_level_remaining(engine: &mut Engine, rice_param: u32) -> Res
         let base = (1u32.checked_shl(prefix - 3).ok_or(HeifError::MalformedHevc("coeff_abs_level_remaining: overflow"))? + 3 - 1) << rice_param;
         Ok(base + codeword)
     }
+}
+
+/// Records significant scan position `pos` of a subblock.
+fn push_sig(buf: &mut [usize; 17], n_sig: &mut usize, pos: usize) -> Result<()> {
+    *buf.get_mut(*n_sig).filter(|_| *n_sig < 16).ok_or(HeifError::MalformedHevc("residual: too many significant coefficients"))? = pos;
+    *n_sig += 1;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -177,7 +182,7 @@ pub fn decode_residual(
     is_luma_or_444: bool,
     sign_data_hiding_enabled: bool,
     coeffs: &mut [i32],
-) -> Result<()> {
+) -> Result<bool> {
     let nt = 1usize << log2_trafo_size;
     let coeffs = coeffs.get_mut(..nt * nt).ok_or(HeifError::MalformedHevc("residual: coefficient buffer too small"))?;
     coeffs.fill(0);
@@ -192,6 +197,8 @@ pub fn decode_residual(
     if scan_idx == 2 {
         std::mem::swap(&mut last_x, &mut last_y);
     }
+    // The last significant coefficient is the DC: no other one is coded.
+    let dc_only = last_x == 0 && last_y == 0;
 
     let sub_scan = scan_order(log2_trafo_size.saturating_sub(2), scan_idx)?;
     let pos_scan = scan_order(2, scan_idx)?;
@@ -240,14 +247,10 @@ pub fn decode_residual(
             continue;
         }
 
-        // A 4x4 subblock has at most 16 significant positions.
-        let mut sig_buf = [0usize; 16];
+        // A 4x4 subblock has at most 16 significant positions; the 17th
+        // slot takes the branch-free loop's write past the last one.
+        let mut sig_buf = [0usize; 17];
         let mut n_sig = 0usize;
-        let mut push_sig = |pos: usize| -> Result<()> {
-            *sig_buf.get_mut(n_sig).ok_or(HeifError::MalformedHevc("residual: too many significant coefficients"))? = pos;
-            n_sig += 1;
-            Ok(())
-        };
         // The last subblock's final coefficient (`last_scan_pos`) was
         // already pushed above as the guaranteed-significant last
         // coefficient, so the AC loop below must start one position
@@ -255,35 +258,38 @@ pub fn decode_residual(
         let last_coeff_in_sb = if i == last_sb { last_scan_pos.saturating_sub(1) } else { 15 };
         let sig_ctx_inc = sig_ctx_row(log2_trafo_size, is_chroma, scan_idx, prev_csbf, s.x + s.y == 0)?;
         if i == last_sb {
-            push_sig(last_scan_pos)?;
+            push_sig(&mut sig_buf, &mut n_sig, last_scan_pos)?;
         }
 
+        // Branch-free: a significance flag is
+        // close to a coin toss, so every position is written and only a
+        // significant one advances the count.
         for n in (1..=last_coeff_in_sb).rev() {
             let p = *pos_scan.get(n).ok_or(HeifError::MalformedHevc("residual: pos scan"))?;
             let ctx_inc = sig_ctx_inc[(p.y * 4 + p.x) as usize & 15];
             let model = ctxs.significant_coeff_flag.get_mut(ctx_inc as usize).ok_or(HeifError::MalformedHevc("significant_coeff_flag: context index"))?;
-            if engine.decision(model)? == 1 {
-                push_sig(n)?;
-                infer_sb_dc_sig = false;
-            }
+            let significant = engine.decision(model)? as usize;
+            *sig_buf.get_mut(n_sig).ok_or(HeifError::MalformedHevc("residual: too many significant coefficients"))? = n;
+            n_sig += significant;
+            infer_sb_dc_sig &= significant == 0;
         }
         // DC of this subblock (scan position 0): coded unless this is
         // the lone last-coefficient subblock whose last position *is*
         // the DC (then there's nothing left to code below it).
         if !(i == last_sb && last_scan_pos == 0) {
             if infer_sb_dc_sig {
-                push_sig(0)?;
+                push_sig(&mut sig_buf, &mut n_sig, 0)?;
             } else {
                 let p0 = *pos_scan.first().ok_or(HeifError::MalformedHevc("residual: pos scan"))?;
                 let ctx_inc = sig_ctx_inc[(p0.y * 4 + p0.x) as usize & 15];
                 let model = ctxs.significant_coeff_flag.get_mut(ctx_inc as usize).ok_or(HeifError::MalformedHevc("significant_coeff_flag: context index"))?;
                 if engine.decision(model)? == 1 {
-                    push_sig(0)?;
+                    push_sig(&mut sig_buf, &mut n_sig, 0)?;
                 }
             }
         }
 
-        let sig_positions = &sig_buf[..n_sig];
+        let sig_positions = sig_buf.get(..n_sig).ok_or(HeifError::MalformedHevc("residual: too many significant coefficients"))?;
         if sig_positions.is_empty() {
             continue;
         }
@@ -302,28 +308,23 @@ pub fn decode_residual(
         let has_max_base_level = &mut has_max_buf[..n_coeff];
         let last_g1 = n_coeff.min(8);
         let mut greater1_ctx = 1i32;
-        let mut new_last_g1_pos: Option<usize> = None;
-        for (c, lvl) in level.iter_mut().enumerate().take(last_g1) {
+        // Branch-free: the flag sets the level,
+        // the max-level marker, `c1`, the next context and the first
+        // greater-than-1 position arithmetically.
+        let mut first_g1 = usize::MAX;
+        for (c, (lvl, has_max)) in level.iter_mut().zip(has_max_base_level.iter_mut()).enumerate().take(last_g1) {
             let ctx_inc = (ctx_set_base * 4 + greater1_ctx.min(3)) as u32 + if is_chroma { 16 } else { 0 };
             let model =
                 ctxs.coeff_abs_level_greater1_flag.get_mut(ctx_inc as usize).ok_or(HeifError::MalformedHevc("coeff_abs_level_greater1_flag: context index"))?;
             let flag = engine.decision(model)?;
-            if flag == 1 {
-                *lvl += 1;
-                c1 = 0;
-                if new_last_g1_pos.is_none() {
-                    new_last_g1_pos = Some(c);
-                }
-                greater1_ctx = 0;
-            } else {
-                if let Some(h) = has_max_base_level.get_mut(c) {
-                    *h = false;
-                }
-                if greater1_ctx > 0 {
-                    greater1_ctx += 1;
-                }
-            }
+            *lvl += flag as i32;
+            *has_max = flag == 1;
+            c1 &= 1 - flag as i32;
+            first_g1 = first_g1.min(if flag == 1 { c } else { usize::MAX });
+            // 0 after a greater-than-1 coefficient, else counts up from 1.
+            greater1_ctx = (greater1_ctx + i32::from(greater1_ctx > 0)) & (flag as i32 - 1);
         }
+        let new_last_g1_pos = (first_g1 != usize::MAX).then_some(first_g1);
 
         if let Some(pos) = new_last_g1_pos {
             let ctx_inc = ctx_set_base as u32 + if is_chroma { 4 } else { 0 };
@@ -346,15 +347,13 @@ pub fn decode_residual(
         let last_scan_pos_in_sb = *sig_positions.last().ok_or(HeifError::MalformedHevc("residual: sig positions"))?;
         let sign_hidden = first_scan_pos.saturating_sub(last_scan_pos_in_sb) > 3;
 
+        // All the sign bins of the subblock in one bypass run.
         let mut sign_buf = [false; 16];
         let sign = &mut sign_buf[..n_coeff];
-        for s in sign.iter_mut().take(n_coeff - 1) {
-            *s = engine.bypass()? == 1;
-        }
-        if (!sign_data_hiding_enabled || !sign_hidden)
-            && let Some(s) = sign.get_mut(n_coeff - 1)
-        {
-            *s = engine.bypass()? == 1;
+        let n_signs = if !sign_data_hiding_enabled || !sign_hidden { n_coeff } else { n_coeff - 1 };
+        let signs = engine.bypass_fl(n_signs as u32)?;
+        for (k, s) in sign.iter_mut().take(n_signs).enumerate() {
+            *s = (signs >> (n_signs - 1 - k)) & 1 == 1;
         }
 
         let mut rice_param = 0u32;
@@ -389,7 +388,7 @@ pub fn decode_residual(
         }
     }
 
-    Ok(())
+    Ok(dc_only)
 }
 
 #[cfg(test)]

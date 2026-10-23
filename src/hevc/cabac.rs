@@ -55,6 +55,22 @@ const NEXT_STATE_LPS: [u8; 64] = [
     33,33,34,34,35,35,35,36,36,36,37,37,37,38,38,63,
 ];
 
+/// Both transitions of every context state at once, indexed
+/// `[is_lps][pStateIdx * 2 + valMps]` and packed the same way, so a
+/// decision updates its context without branching. The LPS row flips `valMps` at state 0, as clause 9.3.4.3.2.2
+/// does.
+const TRANSITION: [[u8; 128]; 2] = {
+    let mut table = [[0u8; 128]; 2];
+    let mut packed = 0;
+    while packed < 128 {
+        let (state, mps) = (packed / 2, (packed % 2) as u8);
+        table[0][packed] = NEXT_STATE_MPS[state] * 2 + mps;
+        table[1][packed] = NEXT_STATE_LPS[state] * 2 + if state == 0 { 1 - mps } else { mps };
+        packed += 1;
+    }
+    table
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ContextModel {
     pub state: u8,
@@ -166,15 +182,61 @@ impl<'a, 'b> Engine<'a, 'b> {
     }
 
     /// `DecodeDecision`, clause 9.3.4.3.2. Never fails; see [`Engine`].
+    ///
+    /// Branch-free: which of MPS and LPS was
+    /// decoded is close to a coin toss for many contexts, so a branch on
+    /// it mispredicts often. The outcome selects the new offset, range and
+    /// context state through masks and [`TRANSITION`] instead, and the
+    /// renormalization shift is applied even when it is zero.
     #[inline(always)]
     pub fn decision(&mut self, ctx: &mut ContextModel) -> Result<u32> {
         // `state` is below 64 (every table entry is) and `range` is in
         // 256..=510, so the masks never change an index; they only let the
         // compiler drop the bounds checks.
         let state = ctx.state as usize & 63;
+        let mps = u32::from(ctx.mps & 1);
+        let lps_range = LPS_RANGE[state][(self.range >> 6) as usize & 3];
+        let mps_range = self.range - lps_range;
+        let is_lps = u32::from(self.offset >= mps_range);
+        let mask = is_lps.wrapping_neg();
+        self.offset -= mps_range & mask;
+        self.range = mps_range ^ ((mps_range ^ lps_range) & mask);
+        let next = TRANSITION[is_lps as usize][state * 2 + mps as usize];
+        ctx.state = next >> 1;
+        ctx.mps = next & 1;
+        // `range` is now in 2..=510: shift it back to 9 bits, 0 to 7 places.
+        let n = self.range.leading_zeros() - 23;
+        self.range <<= n;
+        self.offset = (self.offset << n) | self.read_upto7(n);
+        Ok(mps ^ is_lps)
+    }
+
+    /// [`Engine::read`] for `n` in 0..=7, without a branch on `n == 0`.
+    #[inline(always)]
+    fn read_upto7(&mut self, n: u32) -> u32 {
+        if self.cache_bits < n {
+            self.refill();
+            if self.cache_bits < n {
+                self.overread = true;
+                self.cache_bits = n;
+            }
+        }
+        // Two shifts, so that `n == 0` reads nothing instead of shifting a
+        // `u64` by 64.
+        let v = ((self.cache >> 32) >> (32 - n)) as u32;
+        self.cache <<= n;
+        self.cache_bits -= n;
+        v
+    }
+
+    /// The decision with branches, as clause 9.3.4.3.2 writes it: what
+    /// [`Engine::decision`] did before it went branch-free, kept as the
+    /// reference it is tested against.
+    #[cfg(test)]
+    fn reference_decision(&mut self, ctx: &mut ContextModel) -> u32 {
+        let state = ctx.state as usize & 63;
         let lps_range = LPS_RANGE[state][(self.range >> 6) as usize & 3];
         self.range -= lps_range;
-
         let bin_val;
         if self.offset >= self.range {
             bin_val = 1 - ctx.mps as u32;
@@ -189,7 +251,7 @@ impl<'a, 'b> Engine<'a, 'b> {
             ctx.state = NEXT_STATE_MPS[state];
         }
         self.renormalize();
-        Ok(bin_val)
+        bin_val
     }
 
     /// `DecodeBypass`, clause 9.3.4.3.4. Never fails; see [`Engine`].
@@ -204,15 +266,81 @@ impl<'a, 'b> Engine<'a, 'b> {
     }
 
     /// `FL(n)` using bypass bins, MSB first.
+    ///
+    /// Up to 16 bins at a time by one division: a run of bypass bins is the long division of the offset,
+    /// with the next bits appended, by the unchanging range — each bin is
+    /// one quotient bit, and the remainder is the new offset. `offset`
+    /// stays below `range` (≤ 510), so 16 more bits fit a `u32`.
     pub fn bypass_fl(&mut self, n: u32) -> Result<u32> {
         if n > 31 {
             return Err(HeifError::MalformedHevc("bypass_fl: n too large"));
         }
         let mut v = 0u32;
-        for _ in 0..n {
-            v = (v << 1) | self.bypass()?;
+        let mut left = n;
+        // Only a non-conforming stream leaves `offset` at or above `range`
+        // (an initial 9-bit offset of 510 or 511); there the quotient bits
+        // are not the bins, so it goes bin by bin as before.
+        if self.offset >= self.range {
+            for _ in 0..n {
+                v = (v << 1) | self.bypass()?;
+            }
+            return Ok(v);
+        }
+        while left > 0 {
+            let k = left.min(16);
+            let dividend = (self.offset << k) | self.read(k);
+            let bins = dividend / self.range;
+            self.offset = dividend - bins * self.range;
+            v = (v << k) | bins;
+            left -= k;
         }
         Ok(v)
+    }
+
+    /// A unary run of bypass bins: the 1-bins up to and including the 0
+    /// that ends them, or `max_ones` 1-bins and nothing more. Returns the
+    /// number of 1-bins.
+    ///
+    /// Eight bins per division: the run's
+    /// length is the number of leading ones of the quotient, and only the
+    /// bins up to the terminating zero are consumed — their quotient and
+    /// remainder follow from the same division. Near the end of the data
+    /// it goes bin by bin, so a short read is reported as before.
+    pub fn bypass_unary(&mut self, max_ones: u32) -> Result<u32> {
+        let mut ones = 0u32;
+        while ones < max_ones {
+            if self.cache_bits < 8 || self.offset >= self.range {
+                self.refill();
+                // Near the end of the data, or a non-conforming stream (see
+                // `bypass_fl`): bin by bin.
+                if self.cache_bits < 8 || self.offset >= self.range {
+                    while ones < max_ones && self.bypass()? == 1 {
+                        ones += 1;
+                    }
+                    return Ok(ones);
+                }
+            }
+            let bits = (self.cache >> 56) as u32;
+            let quotient = ((self.offset << 8) | bits) / self.range;
+            // Leading ones of the 8-bin quotient, 0..=8.
+            let leading = (!(quotient << 24)).leading_zeros();
+            let (take, ended) = if ones + leading >= max_ones {
+                (max_ones - ones, false)
+            } else if leading < 8 {
+                (leading + 1, true)
+            } else {
+                (8, false)
+            };
+            let dividend = (self.offset << take) | (bits >> (8 - take));
+            self.offset = dividend - (quotient >> (8 - take)) * self.range;
+            self.cache <<= take;
+            self.cache_bits -= take;
+            ones += take - u32::from(ended);
+            if ended {
+                return Ok(ones);
+            }
+        }
+        Ok(ones)
     }
 
     /// `TU(cMax)` (truncated unary) using bypass bins: counts leading
@@ -263,6 +391,93 @@ impl<'a, 'b> Engine<'a, 'b> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn branch_free_decisions_match_the_specification() {
+        // A pseudo-random stream, one context per (state, MPS), decoded by
+        // two engines: every bin, context, range and offset must agree.
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let data: Vec<u8> = (0..8192)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let (mut r1, mut r2) = (BitReader::new(&data), BitReader::new(&data));
+        let (mut fast, mut reference) = (Engine::new(&mut r1).unwrap(), Engine::new(&mut r2).unwrap());
+        let mut contexts: Vec<ContextModel> = (0..128).map(|i| ContextModel { state: i / 2, mps: i % 2 }).collect();
+        let mut expected = contexts.clone();
+        for i in 0..40_000usize {
+            let k = (i * 7919 + i / 3) % 128;
+            let want = reference.reference_decision(&mut expected[k]);
+            let got = fast.decision(&mut contexts[k]).unwrap();
+            assert_eq!((got, contexts[k], fast.range, fast.offset), (want, expected[k], reference.range, reference.offset), "bin {i}");
+            if i % 5 == 0 {
+                assert_eq!(fast.bypass().unwrap(), reference.bypass().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn bypass_runs_match_bin_by_bin() {
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed as u8
+            })
+            .collect();
+        let (mut r1, mut r2) = (BitReader::new(&data), BitReader::new(&data));
+        let (mut fast, mut slow) = (Engine::new(&mut r1).unwrap(), Engine::new(&mut r2).unwrap());
+        let mut ctx_a = ContextModel { state: 10, mps: 0 };
+        let mut ctx_b = ctx_a;
+        for i in 0..2000u32 {
+            let n = i % 32;
+            let mut want = 0;
+            for _ in 0..n {
+                want = (want << 1) | slow.bypass().unwrap();
+            }
+            assert_eq!(fast.bypass_fl(n).unwrap(), want, "run {i} of {n}");
+            assert_eq!((fast.range, fast.offset), (slow.range, slow.offset));
+            // Interleave decisions so the range varies between runs.
+            assert_eq!(fast.decision(&mut ctx_a).unwrap(), slow.reference_decision(&mut ctx_b));
+        }
+    }
+
+    #[test]
+    fn unary_runs_match_bin_by_bin() {
+        let mut seed = 0xD1B5_4A32_D192_ED03u64;
+        // Long runs of ones are what this is for: bias the bytes toward 0xFF.
+        let data: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                if seed.is_multiple_of(3) { 0xFF } else { seed as u8 | (seed >> 8) as u8 }
+            })
+            .collect();
+        for cut in [data.len(), 37, 11, 3] {
+            let data = &data[..cut];
+            let (mut r1, mut r2) = (BitReader::new(data), BitReader::new(data));
+            let (mut fast, mut slow) = (Engine::new(&mut r1).unwrap(), Engine::new(&mut r2).unwrap());
+            let mut ctx_a = ContextModel { state: 20, mps: 1 };
+            let mut ctx_b = ctx_a;
+            for i in 0..3000u32 {
+                let max = [1, 3, 8, 9, 19, 33][i as usize % 6];
+                let mut want = 0;
+                while want < max && slow.bypass().unwrap() == 1 {
+                    want += 1;
+                }
+                assert_eq!(fast.bypass_unary(max).unwrap(), want, "cut {cut} run {i} max {max}");
+                assert_eq!((fast.range, fast.offset, fast.overread), (slow.range, slow.offset, slow.overread), "cut {cut} run {i}");
+                assert_eq!(fast.decision(&mut ctx_a).unwrap(), slow.reference_decision(&mut ctx_b));
+            }
+        }
+    }
 
     #[test]
     fn context_init_matches_known_example() {

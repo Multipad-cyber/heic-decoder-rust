@@ -67,8 +67,15 @@ impl Dequant {
         if !(0..=255).contains(&weight) {
             return Err(HeifError::MalformedHevc("dequant: parameter out of range"));
         }
+        Ok(self.apply_checked(level, weight))
+    }
+
+    /// [`Dequant::apply`] with a weight already known to be in 0..=255
+    /// (a [`super::scaling::ScalingWeights`] entry, or the flat 16).
+    #[inline(always)]
+    pub fn apply_checked(self, level: i32, weight: i32) -> i32 {
         let v = (i64::from(level) * i64::from(weight) * self.fact + (1i64 << (self.shift - 1))) >> self.shift;
-        Ok(v.clamp(-32768, 32767) as i32)
+        v.clamp(-32768, 32767) as i32
     }
 }
 
@@ -188,6 +195,21 @@ pub fn inverse_transform(coeffs: &[i32], nt: usize, bit_depth: u32, use_dst: boo
     Ok(())
 }
 
+/// [`inverse_transform`] of a DCT block whose only nonzero coefficient is
+/// the DC. Row 0 of every DCT basis is 64,
+/// so both stages reduce to one product each and the residual is flat:
+/// the same arithmetic as [`two_stage`], done once instead of per sample.
+/// Not for the 4x4 DST, whose first basis row is not constant.
+pub fn inverse_dct_dc(dc: i32, bit_depth: u32, out: &mut [i32]) -> Result<()> {
+    let bd_shift = match 20u32.checked_sub(bit_depth) {
+        Some(shift) if shift >= 1 => shift,
+        _ => return Err(HeifError::Unsupported("inverse_transform: bit depth too high")),
+    };
+    let g = clip_coeff((64 * clip_coeff(dc) + 64) >> 7);
+    out.fill((64 * g + (1 << (bd_shift - 1))) >> bd_shift);
+    Ok(())
+}
+
 /// The separable two-stage transform of clause 8.6.4.2 with basis `m`
 /// (`m[j][i]`: basis function `j` at sample `i`). `coeffs` and `out` hold
 /// exactly `N * N` values.
@@ -203,7 +225,9 @@ fn two_stage<const N: usize>(coeffs: &[i32], m: &[[i32; N]; N], bd_shift: u32, o
     // one coefficient row j at a time so the inner loop runs along c.
     let mut g = [[0i32; N]; N];
     for (row, basis) in coeffs.as_chunks::<N>().0.iter().zip(m) {
-        if row.iter().all(|&d| d == 0) {
+        // Small blocks: computing a zero row costs less than the
+        // mispredicted branch that would skip it.
+        if N >= 16 && row.iter().all(|&d| d == 0) {
             continue;
         }
         let d = row.map(clip_coeff);
@@ -224,7 +248,7 @@ fn two_stage<const N: usize>(coeffs: &[i32], m: &[[i32; N]; N], bd_shift: u32, o
     for (dst, g_row) in out.as_chunks_mut::<N>().0.iter_mut().zip(&g) {
         let mut acc = [0i32; N];
         for (&gj, basis) in g_row.iter().zip(m) {
-            if gj == 0 {
+            if N >= 16 && gj == 0 {
                 continue;
             }
             for (a, &weight) in acc.iter_mut().zip(basis) {
@@ -240,6 +264,37 @@ fn two_stage<const N: usize>(coeffs: &[i32], m: &[[i32; N]; N], bd_shift: u32, o
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_zero_level_dequantizes_to_zero_whatever_the_parameters() {
+        for bit_depth in 8..=16 {
+            for log2_size in 2..=5 {
+                for qp in 0..=51 + 6 * (bit_depth as i32 - 8) {
+                    let scale = Dequant::new(qp, bit_depth, log2_size).unwrap();
+                    for weight in [0, 1, 16, 255] {
+                        assert_eq!(scale.apply_checked(0, weight), 0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn the_dc_shortcut_matches_the_full_transform() {
+        for nt in [4usize, 8, 16, 32] {
+            for bit_depth in [8, 10, 12] {
+                for dc in [-32768, -32767, -4097, -1000, -65, -64, -63, -1, 0, 1, 63, 64, 65, 999, 4096, 32767] {
+                    let mut coeffs = vec![0; nt * nt];
+                    coeffs[0] = dc;
+                    let mut full = vec![7; nt * nt];
+                    inverse_transform(&coeffs, nt, bit_depth, false, &mut full).unwrap();
+                    let mut fast = vec![7; nt * nt];
+                    inverse_dct_dc(dc, bit_depth, &mut fast).unwrap();
+                    assert_eq!(fast, full, "nt {nt} depth {bit_depth} dc {dc}");
+                }
+            }
+        }
+    }
 
     // Buffers start out full of garbage, as reused decoder scratch would.
     fn idct(coeffs: &[i32], nt: usize, bit_depth: u32, use_dst: bool) -> Result<Vec<i32>> {

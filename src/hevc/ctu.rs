@@ -15,9 +15,9 @@ use super::inter::{Motion, compensate};
 use super::intra::{Border, predict_angular, predict_dc, predict_planar};
 use super::params::{Pps, Sps};
 use super::residual::decode_residual;
-use super::scaling::ScalingListData;
+use super::scaling::{ScalingListData, ScalingWeights};
 use super::slice::InterSlice;
-use super::transform::{Dequant, chroma_qp_mapping, inverse_transform, transform_skip_residual};
+use super::transform::{Dequant, chroma_qp_mapping, inverse_dct_dc, inverse_transform, transform_skip_residual};
 use crate::bitreader::BitReader;
 use crate::error::{HeifError, Result};
 use crate::timing::{self, Stage};
@@ -432,7 +432,7 @@ struct Decoder<'e, 'b, 'c> {
     ctxs: Contexts,
     sps: Sps,
     pps: Pps,
-    scaling_list: Option<&'e ScalingListData>,
+    scaling_list: Option<&'e ScalingWeights>,
     /// Current QG's QpY; at the next QG entry, this is the previous QG's
     /// final QpY used as the fallback for unavailable neighbor predictors.
     qp_y_prev: i32,
@@ -1217,7 +1217,7 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                 };
                 let intra_pred_mode = if self.current_intra { mode as u32 } else { 0 };
                 let coeffs = block(&mut scratch.coeffs, nt)?;
-                decode_residual(
+                let dc_only = decode_residual(
                     self.engine,
                     &mut self.ctxs,
                     log2_size,
@@ -1248,23 +1248,36 @@ impl<'e, 'b, 'c> Decoder<'e, 'b, 'c> {
                     };
                     let dequantized = block(&mut scratch.dequantized, nt)?;
                     let scale = Dequant::new(qp, bit_depth, log2_size)?;
-                    for (i, (o, &c)) in dequantized.iter_mut().zip(coeffs.iter()).enumerate() {
-                        // A zero level dequantizes to zero, and most of a block is zeros.
-                        if c == 0 {
-                            *o = 0;
-                            continue;
-                        }
+                    let use_dst = self.current_intra && cidx == 0 && nt == 4;
+                    if dc_only && !transform_skip && !use_dst {
+                        // Flat areas code most blocks as one DC level.
                         let weight = match self.scaling_list {
-                            Some(list) => list.weight(log2_size, cidx, i % nt, i / nt)?,
+                            Some(weights) => *weights.table(log2_size, cidx)?.first().ok_or(HeifError::MalformedHevc("scaling list: empty table"))?,
                             None => 16,
                         };
-                        *o = scale.apply(c, weight)?;
-                    }
-                    if transform_skip {
-                        transform_skip_residual(dequantized, nt, bit_depth, res)?;
+                        inverse_dct_dc(scale.apply_checked(coeffs[0], weight), bit_depth, res)?;
                     } else {
-                        let use_dst = self.current_intra && cidx == 0 && nt == 4;
-                        inverse_transform(dequantized, nt, bit_depth, use_dst, res)?;
+                        // Every coefficient, zeros included: a zero level comes
+                        // out zero anyway (the rounding term is below the shift),
+                        // and a branch on it would mispredict and keep the loop
+                        // from vectorizing.
+                        match self.scaling_list {
+                            Some(weights) => {
+                                for ((o, &c), &weight) in dequantized.iter_mut().zip(coeffs.iter()).zip(weights.table(log2_size, cidx)?) {
+                                    *o = scale.apply_checked(c, weight);
+                                }
+                            }
+                            None => {
+                                for (o, &c) in dequantized.iter_mut().zip(coeffs.iter()) {
+                                    *o = scale.apply_checked(c, 16);
+                                }
+                            }
+                        }
+                        if transform_skip {
+                            transform_skip_residual(dequantized, nt, bit_depth, res)?;
+                        } else {
+                            inverse_transform(dequantized, nt, bit_depth, use_dst, res)?;
+                        }
                     }
                 }
                 drop(timer);
@@ -1363,7 +1376,12 @@ pub(crate) fn decode_slice_rows(
     if pps.diff_cu_qp_delta_depth > sps.log2_diff_max_min_luma_coding_block_size {
         return Err(HeifError::MalformedHevc("QP: quantization group smaller than minimum CU"));
     }
-    let scaling_list = if sps.scaling_list_enabled { Some(pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()).cloned().unwrap_or_default()) } else { None };
+    let default_list = ScalingListData::default();
+    let scaling_list = if sps.scaling_list_enabled {
+        Some(ScalingWeights::new(pps.scaling_list.as_ref().or(sps.scaling_list.as_ref()).unwrap_or(&default_list))?)
+    } else {
+        None
+    };
     let ctb_size = 1usize << ctb_log2;
     let pic_width_ctbs = (sps.pic_width_in_luma_samples as usize).div_ceil(ctb_size);
     let pic_height_ctbs = (sps.pic_height_in_luma_samples as usize).div_ceil(ctb_size);
