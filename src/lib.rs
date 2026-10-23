@@ -31,6 +31,8 @@ pub mod bitreader;
 mod bitreader;
 mod color;
 mod error;
+// Decoding to a small RGB image in bounded memory.
+mod fit;
 #[cfg(feature = "internals")]
 pub mod hevc;
 #[cfg(not(feature = "internals"))]
@@ -50,6 +52,7 @@ mod timing;
 
 pub use color::{ChromaSampling, ChromaUpsampling, ColorInfo, RgbImage, RgbOptions, RgbaImage};
 pub use error::{HeifError, Result};
+pub use fit::{FitOptions, decode_rgb8_fit};
 pub use isobmff::Metadata;
 
 /// Largest picture, in luma samples, that the decoder will allocate
