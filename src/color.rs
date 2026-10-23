@@ -16,10 +16,11 @@ pub struct ColorInfo {
 }
 
 impl Default for ColorInfo {
-    /// Unlabelled/unspecified matrices use BT.709 limited range. Primaries
-    /// and transfer remain unspecified; this does not declare sRGB.
+    /// Unlabelled images use BT.601 limited range, as libheif does (and
+    /// MIAF's default matrix). Primaries and transfer remain unspecified;
+    /// this does not declare sRGB.
     fn default() -> Self {
-        Self { color_primaries: 2, transfer_characteristics: 2, matrix_coefficients: 1, full_range: false }
+        Self { color_primaries: 2, transfer_characteristics: 2, matrix_coefficients: 6, full_range: false }
     }
 }
 
@@ -210,9 +211,10 @@ impl Matrix {
     fn new(info: ColorInfo, y_depth: u32, c_depth: u32) -> Result<Self> {
         let (kr, kb) = match info.matrix_coefficients {
             0 => (0.0, 0.0),
-            1 | 2 => (0.2126, 0.0722),
+            1 => (0.2126, 0.0722),
             4 => (0.30, 0.11),
-            5 | 6 => (0.299, 0.114),
+            // Unspecified (2) as libheif reads it: BT.601.
+            2 | 5 | 6 => (0.299, 0.114),
             7 => (0.212, 0.087),
             9 => (0.2627, 0.0593),
             _ => return Err(HeifError::Unsupported("RGB: unsupported matrix coefficients")),
@@ -546,10 +548,11 @@ mod tests {
         let options = RgbOptions { color: Some(info(1, false)), ..Default::default() };
         assert_eq!(image.to_rgb8_with_options(&options).unwrap().data, [255, 46, 18]);
         assert_eq!(image.to_rgb8().unwrap().data, [255, 22, 21]);
+        // Unlabelled and unspecified both read as BT.601, as in libheif.
         image.color_info = None;
-        assert_eq!(image.to_rgb8().unwrap().data, [255, 46, 18]);
+        assert_eq!(image.to_rgb8().unwrap().data, [255, 22, 21]);
         image.color_info = Some(info(2, false));
-        assert_eq!(image.to_rgb8().unwrap().data, [255, 46, 18]);
+        assert_eq!(image.to_rgb8().unwrap().data, [255, 22, 21]);
     }
     #[test]
     fn bilinear_upsampling_uses_chroma_locations_and_nearest_is_optional() {
