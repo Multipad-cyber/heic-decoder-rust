@@ -172,12 +172,12 @@ fn quantize_without_round(value: f32, scale: f32, max: u32) -> u32 {
     nearest + u32::from(clamped - (shifted - TWO_23) == 0.5)
 }
 
-struct Axis {
-    lo: usize,
-    hi: usize,
-    weight: f32,
+pub(crate) struct Axis {
+    pub(crate) lo: usize,
+    pub(crate) hi: usize,
+    pub(crate) weight: f32,
 }
-fn axis(count: usize, samples: usize, sub: u32, origin: f32, filter: ChromaUpsampling) -> Result<Vec<Axis>> {
+pub(crate) fn axis(count: usize, samples: usize, sub: u32, origin: f32, filter: ChromaUpsampling) -> Result<Vec<Axis>> {
     let mut result = Vec::new();
     result.try_reserve_exact(count).map_err(|_| HeifError::LimitExceeded("RGB: sampling allocation failed"))?;
     result.extend((0..count).map(|pixel| {
@@ -265,6 +265,68 @@ impl Matrix {
             }
         }
     }
+}
+
+/// [`convert`]'s arithmetic for one pixel at a time, for decoders that
+/// produce RGB without assembling the planes first. Each step is the same
+/// `f32` expression, in the same order, so the result is bit-identical.
+pub(crate) struct PixelRgb {
+    matrix: Matrix,
+    monochrome: bool,
+}
+
+impl PixelRgb {
+    /// As [`convert`] sets up its matrix for this colour information,
+    /// format and depths.
+    pub(crate) fn new(info: ColorInfo, chroma_format_idc: u32, sampling: ChromaSampling, y_depth: u32, c_depth: u32) -> Result<Self> {
+        let monochrome = chroma_format_idc == 0;
+        let matrix = Matrix::new(if monochrome { ColorInfo { matrix_coefficients: 1, ..info } } else { info }, y_depth, c_depth)?;
+        if matrix.identity && (sampling.sub_x != 1 || sampling.sub_y != 1) {
+            return Err(HeifError::Unsupported("RGB: identity matrix requires 4:4:4"));
+        }
+        Ok(PixelRgb { matrix, monochrome })
+    }
+
+    /// `ChromaRows::slot`'s horizontal interpolation of one chroma row.
+    #[inline(always)]
+    pub(crate) fn lerp_samples(lo: i32, hi: i32, weight: f32) -> f32 {
+        lo as f32 * (1.0 - weight) + hi as f32 * weight
+    }
+
+    /// `ChromaRows::blend`'s vertical interpolation of two such rows.
+    #[inline(always)]
+    pub(crate) fn lerp_rows(top: f32, bottom: f32, weight: f32) -> f32 {
+        top * (1.0 - weight) + bottom * weight
+    }
+
+    /// One pixel, as `Matrix::row` (or the monochrome branch) writes it.
+    #[inline(always)]
+    pub(crate) fn rgb8(&self, y: i32, cb: f32, cr: f32) -> [u8; 3] {
+        let m = &self.matrix;
+        if self.monochrome {
+            return [u8::quantize((y as f32 - m.y_offset) * m.y_scale); 3];
+        }
+        if m.identity {
+            return [
+                u8::quantize((cr - m.c_offset) * m.c_scale),
+                u8::quantize((y as f32 - m.y_offset) * m.y_scale),
+                u8::quantize((cb - m.c_offset) * m.c_scale),
+            ];
+        }
+        let y = (y as f32 - m.y_offset) * m.y_scale;
+        let cb = (cb - m.c_offset) * m.c_scale;
+        let cr = (cr - m.c_offset) * m.c_scale;
+        [u8::quantize(y + m.red_cr * cr), u8::quantize(y + m.green_cb * cb + m.green_cr * cr), u8::quantize(y + m.blue_cb * cb)]
+    }
+
+    pub(crate) fn monochrome(&self) -> bool {
+        self.monochrome
+    }
+}
+
+/// An alpha sample as [`DecodedImage::to_rgba8`] scales it to 0..=255.
+pub(crate) fn alpha8(sample: u32, max: u32) -> u8 {
+    u8::alpha(sample, max)
 }
 
 /// Chroma rows interpolated horizontally to the output width, Cb and Cr,
